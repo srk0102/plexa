@@ -1,4 +1,4 @@
-<h1 align="center">Project G</h1>
+<h1 align="center">Plexa</h1>
 
 <p align="center">
   One brain. Many bodies.
@@ -12,18 +12,18 @@
   <a href="https://github.com/srk0102/SCP"><img src="https://img.shields.io/badge/built%20on-scp--protocol-818CF8" alt="scp"/></a>
 </p>
 
-> SCP gives AI one body. Project G gives AI a whole body.
+> SCP gives AI one body. Plexa gives AI a whole body.
 
 ---
 
 ## What it does
 
-Project G is an orchestration layer that sits above [SCP](https://github.com/srk0102/SCP). It coordinates multiple SCP adapters under a single LLM brain.
+Plexa is an orchestration layer that sits above [SCP](https://github.com/srk0102/SCP). It coordinates multiple SCP adapters under a single LLM brain.
 
 ```
 LLM (Brain)
     |
-Project G (Orchestrator)
+Plexa (Orchestrator)
     |
 Multiple SCP adapters (Body parts)
     |
@@ -49,11 +49,11 @@ No reasoning. No safety logic. No pattern matching. Four jobs only.
 
 ```
 LLM decides:           WHAT (intent, goals)
-Project G decides:     WHEN and HOW (sequencing, timing)
+Plexa decides:     WHEN and HOW (sequencing, timing)
 SCP adapters decide:   WHETHER (safety veto, hardware limits)
 ```
 
-These three layers never overlap. Project G is not a brain. It is a sequencer.
+These three layers never overlap. Plexa is not a brain. It is a sequencer.
 
 ---
 
@@ -105,9 +105,9 @@ SCP adapters run in two modes:
 | Mode | Brain | Pattern store | Reflexes |
 |------|-------|--------------|----------|
 | **standalone** | Local LLM bridge | Local decisions | Local |
-| **managed** | Project G | Logs only, no decisions | Local |
+| **managed** | Plexa | Logs only, no decisions | Local |
 
-Project G automatically flips connected adapters to managed mode. The adapter keeps reflexes and physics local. The brain lives in Project G.
+Plexa automatically flips connected adapters to managed mode. The adapter keeps reflexes and physics local. The brain lives in Plexa.
 
 ---
 
@@ -118,7 +118,7 @@ Read sensors in SCP muscle
   |
 Reflex check (always local, fastest)
   |
-Emit event UP via HTTP to Project G
+Emit event UP via HTTP to Plexa
   |
 Space aggregator compresses state from all bodies
   |
@@ -157,7 +157,7 @@ plexa/
   examples/
     hello-world/        End-to-end demo
   tests/
-    project-g.test.js   43 tests, 0 failures
+    plexa.test.js       43 tests, 0 failures
 ```
 
 ---
@@ -171,7 +171,7 @@ SCP (scp-protocol)
   Controls one body
   Done. Shipped. v0.1.1.
 
-Project G
+Plexa
   Orchestration framework
   npm install @srk0102/plexa
   Coordinates multiple SCP bodies
@@ -179,7 +179,7 @@ Project G
   Built on scp-protocol.
 ```
 
-Same pattern as Express and Node HTTP. Project G depends on scp-protocol. scp-protocol does not know about Project G.
+Same pattern as Express and Node HTTP. Plexa depends on scp-protocol. scp-protocol does not know about Plexa.
 
 ---
 

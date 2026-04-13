@@ -14,7 +14,7 @@
     "./bridges/ollama": "./packages/bridges/ollama.js"
   },
   "scripts": {
-    "test": "node --test tests/project-g.test.js",
+    "test": "node --test tests/plexa.test.js",
     "hello": "node examples/hello-world/index.js"
   },
   "keywords": [
