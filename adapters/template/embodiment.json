@@ -1,0 +1,18 @@
+{
+  "embodiment_id": "template-body-v1",
+  "scp_version": "0.1.0",
+  "dimensions": "2d",
+  "label": "Template SCP body for Project G testing",
+  "actuators": [
+    { "actuator_id": "mover", "rest_position": [0, 0], "reach": 5, "max_velocity": 1 }
+  ],
+  "sensors": ["position", "velocity", "entity_detection"],
+  "workspace": {
+    "min": [-10, -10],
+    "max": [10, 10]
+  },
+  "constraints": {
+    "max_speed": 1.0,
+    "collision_radius": 0.5
+  }
+}

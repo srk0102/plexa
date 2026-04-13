@@ -1,0 +1,45 @@
+{
+  "name": "project-g",
+  "version": "0.1.0",
+  "description": "Orchestration framework above SCP. One brain, many bodies.",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./core": "./packages/core/index.js",
+    "./core/space": "./packages/core/space.js",
+    "./core/body-adapter": "./packages/core/body-adapter.js",
+    "./core/brain": "./packages/core/brain.js",
+    "./core/translator": "./packages/core/translator.js",
+    "./core/aggregator": "./packages/core/aggregator.js",
+    "./bridges/ollama": "./packages/bridges/ollama.js"
+  },
+  "scripts": {
+    "test": "node --test tests/project-g.test.js",
+    "hello": "node examples/hello-world/index.js"
+  },
+  "keywords": [
+    "embodied-ai",
+    "llm",
+    "orchestration",
+    "robotics",
+    "scp-protocol"
+  ],
+  "author": "srk0102",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/srk0102/project-g"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "dependencies": {
+    "scp-protocol": "^0.1.1"
+  },
+  "files": [
+    "index.js",
+    "packages/",
+    "LICENSE",
+    "README.md"
+  ]
+}

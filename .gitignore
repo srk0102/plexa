@@ -1,0 +1,6 @@
+node_modules/
+*.log
+.DS_Store
+.env
+PROJECT_SPACE_PLAN.md
+PLAN.md
