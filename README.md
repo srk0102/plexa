@@ -8,7 +8,7 @@
 
 <p align="center">
   <a href="https://npmjs.com/package/@srk0102/plexa"><img src="https://img.shields.io/npm/v/@srk0102/plexa?color=4F46E5&label=npm" alt="npm"/></a>
-  <a href="https://github.com/srk0102/project-G"><img src="https://img.shields.io/github/license/srk0102/project-G?color=818CF8" alt="license"/></a>
+  <a href="https://github.com/srk0102/plexa"><img src="https://img.shields.io/github/license/srk0102/plexa?color=818CF8" alt="license"/></a>
   <a href="https://github.com/srk0102/SCP"><img src="https://img.shields.io/badge/built%20on-scp--protocol-818CF8" alt="scp"/></a>
 </p>
 
@@ -60,8 +60,8 @@ These three layers never overlap. Project G is not a brain. It is a sequencer.
 ## Hello world
 
 ```bash
-git clone https://github.com/srk0102/project-G.git
-cd project-G
+git clone https://github.com/srk0102/plexa.git
+cd plexa
 npm install
 node examples/hello-world/index.js
 ```
@@ -142,7 +142,7 @@ Single-threaded reactor at 120Hz. No locks. No polling. Deterministic tick budge
 ## Package structure
 
 ```
-project-G/
+plexa/
   packages/
     core/
       space.js          Space orchestrator
