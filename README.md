@@ -7,7 +7,7 @@
 </p>
 
 <p align="center">
-  <a href="https://npmjs.com/package/project-g"><img src="https://img.shields.io/npm/v/project-g?color=4F46E5&label=npm" alt="npm"/></a>
+  <a href="https://npmjs.com/package/@srk0102/plexa"><img src="https://img.shields.io/npm/v/@srk0102/plexa?color=4F46E5&label=npm" alt="npm"/></a>
   <a href="https://github.com/srk0102/project-G"><img src="https://img.shields.io/github/license/srk0102/project-G?color=818CF8" alt="license"/></a>
   <a href="https://github.com/srk0102/SCP"><img src="https://img.shields.io/badge/built%20on-scp--protocol-818CF8" alt="scp"/></a>
 </p>
@@ -75,7 +75,7 @@ Ollama optional: install from [ollama.ai](https://ollama.ai) and run `ollama pul
 ## API
 
 ```javascript
-const { Space, BodyAdapter, OllamaBrain } = require("project-g")
+const { Space, BodyAdapter, OllamaBrain } = require("@srk0102/plexa")
 const { HTTPTransport } = require("scp-protocol")
 
 class MyBody extends BodyAdapter {
@@ -173,7 +173,7 @@ SCP (scp-protocol)
 
 Project G
   Orchestration framework
-  npm install project-g
+  npm install @srk0102/plexa
   Coordinates multiple SCP bodies
   One brain for the whole body
   Built on scp-protocol.
