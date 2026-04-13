@@ -1,3 +1,13 @@
+// Event priority levels. Lower value = higher priority (drop last).
+const PRIORITY = {
+  CRITICAL: 0,  // never trimmed (collisions, emergencies, failures)
+  HIGH: 1,      // trimmed only if severely over budget
+  NORMAL: 2,    // trimmed after LOW when over budget
+  LOW: 3,       // trimmed first when over budget
+};
+
+const VALID_PRIORITIES = new Set(Object.keys(PRIORITY));
+
 // BodyAdapter -- base class for a single SCP-controlled body in a Space.
 // One BodyAdapter wraps one SCP adapter (muscle layer running elsewhere).
 //
@@ -183,21 +193,35 @@ class BodyAdapter {
   /**
    * Push a semantic event up to the Space.
    * Bodies call this when they detect something the brain should know about.
+   *
+   * @param {string} eventType - event name (e.g. "collision_warning")
+   * @param {object} [payload] - event payload
+   * @param {string} [priority] - CRITICAL | HIGH | NORMAL | LOW, default NORMAL
    */
-  emit(eventType, payload = {}) {
+  emit(eventType, payload = {}, priority = "NORMAL") {
+    if (!VALID_PRIORITIES.has(priority)) {
+      priority = "NORMAL";
+    }
+
     this._state.pending_events.push({
       type: eventType,
       payload,
+      priority,
       ts: Date.now(),
     });
 
-    // Cap the pending events queue
+    // Cap the pending events queue, preserving CRITICAL and HIGH first
     if (this._state.pending_events.length > 20) {
-      this._state.pending_events = this._state.pending_events.slice(-20);
+      // Keep newest 20, but promote any CRITICAL we would otherwise drop
+      const recent = this._state.pending_events.slice(-20);
+      const droppedCritical = this._state.pending_events
+        .slice(0, -20)
+        .filter((e) => e.priority === "CRITICAL");
+      this._state.pending_events = [...droppedCritical, ...recent];
     }
 
     if (this.space) {
-      this.space.onBodyEvent(this.name, eventType, payload);
+      this.space.onBodyEvent(this.name, eventType, payload, priority);
     }
   }
 
@@ -232,4 +256,4 @@ class BodyAdapter {
   }
 }
 
-module.exports = { BodyAdapter };
+module.exports = { BodyAdapter, PRIORITY };

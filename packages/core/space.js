@@ -188,8 +188,8 @@ class Space extends EventEmitter {
 
   // -- Events from bodies --
 
-  onBodyEvent(bodyName, eventType, payload) {
-    this.emit("body_event", { body: bodyName, type: eventType, payload });
+  onBodyEvent(bodyName, eventType, payload, priority = "NORMAL") {
+    this.emit("body_event", { body: bodyName, type: eventType, payload, priority });
     this._addToHistory(`${bodyName}: event ${eventType}`);
   }
 

@@ -187,6 +187,37 @@ describe("BodyAdapter execute", () => {
     b.clearPendingEvents();
     assert.strictEqual(b.snapshot().pending_events.length, 0);
   });
+
+  test("emit defaults to NORMAL priority", () => {
+    const b = makeBody("a");
+    b.emit("some_event");
+    const e = b.snapshot().pending_events[0];
+    assert.strictEqual(e.priority, "NORMAL");
+  });
+
+  test("emit accepts CRITICAL priority", () => {
+    const b = makeBody("a");
+    b.emit("collision_warning", {}, "CRITICAL");
+    const e = b.snapshot().pending_events[0];
+    assert.strictEqual(e.priority, "CRITICAL");
+  });
+
+  test("emit rejects invalid priority and falls back to NORMAL", () => {
+    const b = makeBody("a");
+    b.emit("x", {}, "EMERGENCY"); // not a valid level
+    const e = b.snapshot().pending_events[0];
+    assert.strictEqual(e.priority, "NORMAL");
+  });
+
+  test("queue overflow keeps CRITICAL events", () => {
+    const b = makeBody("a");
+    b.emit("critical_1", {}, "CRITICAL");
+    for (let i = 0; i < 25; i++) b.emit(`low_${i}`, {}, "LOW");
+    const events = b.snapshot().pending_events;
+    const criticals = events.filter((e) => e.priority === "CRITICAL");
+    assert.ok(criticals.length >= 1, "CRITICAL event should survive queue overflow");
+    assert.strictEqual(criticals[0].type, "critical_1");
+  });
 });
 
 // -- Brain base class --
@@ -435,5 +466,81 @@ describe("Aggregator", () => {
     b.setState({ note: "z".repeat(500) });
     const out = a.aggregate(new Map([["x", b]]));
     assert.ok(out.bodies.x.note.length <= 120);
+  });
+
+  test("drops LOW events before NORMAL when over budget", () => {
+    const a = new Aggregator({ tokenBudget: 120, maxPendingEventsPerBody: 50 });
+    const b = new BodyAdapter({ name: "x", transport: new FakeTransport() });
+    for (let i = 0; i < 10; i++) b.emit(`low_${i}`, {}, "LOW");
+    for (let i = 0; i < 10; i++) b.emit(`normal_${i}`, {}, "NORMAL");
+    const out = a.aggregate(new Map([["x", b]]));
+    const s = a.getStats();
+    assert.ok(s.droppedByPriority.LOW >= s.droppedByPriority.NORMAL,
+      `LOW should be dropped at least as aggressively as NORMAL. LOW=${s.droppedByPriority.LOW} NORMAL=${s.droppedByPriority.NORMAL}`);
+  });
+
+  test("CRITICAL events survive severe budget pressure", () => {
+    const a = new Aggregator({ tokenBudget: 200, maxPendingEventsPerBody: 50 });
+    const b = new BodyAdapter({ name: "x", transport: new FakeTransport() });
+    b.emit("collision_warning", { severity: "high" }, "CRITICAL");
+    b.setState({ big: "x".repeat(500), other: "y".repeat(500) });
+    // Add many LOW events to push size way past budget
+    for (let i = 0; i < 30; i++) b.emit(`low_${i}`, { data: "z".repeat(30) }, "LOW");
+
+    const out = a.aggregate(new Map([["x", b]]));
+    // Body still exists
+    assert.ok(out.bodies.x, "body should not be dropped when it has CRITICAL events");
+    // CRITICAL event survived
+    const events = out.bodies.x.pending_events || [];
+    const critical = events.find((e) => e.type === "collision_warning");
+    assert.ok(critical, "CRITICAL event must survive trimming");
+    assert.strictEqual(critical.priority, "CRITICAL");
+  });
+
+  test("CRITICAL events kept even in per-body cap", () => {
+    const a = new Aggregator({ maxPendingEventsPerBody: 3 });
+    const b = new BodyAdapter({ name: "x", transport: new FakeTransport() });
+    b.emit("crit_1", {}, "CRITICAL");
+    b.emit("crit_2", {}, "CRITICAL");
+    for (let i = 0; i < 10; i++) b.emit(`low_${i}`, {}, "LOW");
+
+    const out = a.aggregate(new Map([["x", b]]));
+    const events = out.bodies.x.pending_events;
+    const criticals = events.filter((e) => e.priority === "CRITICAL");
+    assert.strictEqual(criticals.length, 2, "both CRITICAL events must be kept");
+  });
+
+  test("body with CRITICAL events dropped last", () => {
+    const a = new Aggregator({ tokenBudget: 100, maxPendingEventsPerBody: 50 });
+    const bodies = new Map();
+    const critical = new BodyAdapter({ name: "critical_body", transport: new FakeTransport() });
+    critical.emit("alert", {}, "CRITICAL");
+    critical.setState({ data: "x".repeat(200) });
+
+    const normal = new BodyAdapter({ name: "normal_body", transport: new FakeTransport() });
+    normal.setState({ data: "y".repeat(200) });
+
+    bodies.set("normal_body", normal);
+    bodies.set("critical_body", critical);
+
+    const out = a.aggregate(bodies);
+    // If any body survives, the critical one should
+    if (out.bodies.critical_body || out.bodies.normal_body) {
+      assert.ok(out.bodies.critical_body,
+        "critical_body must survive longer than normal_body");
+    }
+  });
+
+  test("priority stats track drops by level", () => {
+    // Force budget pressure with lots of events, not bulk state.
+    const a = new Aggregator({ tokenBudget: 80, maxPendingEventsPerBody: 50 });
+    const b = new BodyAdapter({ name: "x", transport: new FakeTransport() });
+    for (let i = 0; i < 20; i++) b.emit(`low_${i}`, {}, "LOW");
+    for (let i = 0; i < 20; i++) b.emit(`normal_${i}`, {}, "NORMAL");
+
+    a.aggregate(new Map([["x", b]]));
+    const s = a.getStats();
+    const total = s.droppedByPriority.LOW + s.droppedByPriority.NORMAL + s.droppedByPriority.HIGH;
+    assert.ok(total > 0, `expected at least one drop, got stats: ${JSON.stringify(s.droppedByPriority)}`);
   });
 });

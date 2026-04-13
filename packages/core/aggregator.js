@@ -1,18 +1,29 @@
 // Aggregator -- JOB 3: collect state from all bodies and compress into
 // a single world-state object for the brain. Enforces a token budget so
-// the LLM context stays small. Never throws.
+// the LLM context stays small.
+//
+// Priority order (lower number = higher priority, drop last):
+//   CRITICAL (0)  never trimmed
+//   HIGH     (1)  trimmed only if severely over budget
+//   NORMAL   (2)  trimmed after LOW
+//   LOW      (3)  trimmed first
 
 const DEFAULT_TOKEN_BUDGET = 2000;
-// Conservative estimate: 1 token ~ 4 characters for English + JSON.
 const CHARS_PER_TOKEN = 4;
+
+const PRIORITY_RANK = { CRITICAL: 0, HIGH: 1, NORMAL: 2, LOW: 3 };
+
+function priorityRank(p) {
+  return PRIORITY_RANK[p] ?? PRIORITY_RANK.NORMAL;
+}
 
 class Aggregator {
   /**
    * @param {object} [opts]
    * @param {number} [opts.tokenBudget] - default 2000
-   * @param {number} [opts.maxHistory] - max recent history entries, default 10
-   * @param {number} [opts.staleMs] - snapshots older than this are flagged, default 1000ms
-   * @param {number} [opts.maxPendingEventsPerBody] - cap events per body, default 5
+   * @param {number} [opts.maxHistory] - default 10
+   * @param {number} [opts.staleMs] - default 1000ms
+   * @param {number} [opts.maxPendingEventsPerBody] - default 5
    */
   constructor(opts = {}) {
     this.tokenBudget = opts.tokenBudget || DEFAULT_TOKEN_BUDGET;
@@ -23,19 +34,12 @@ class Aggregator {
     this.stats = {
       aggregations: 0,
       trimmed: 0,
+      droppedEvents: 0,
+      droppedByPriority: { CRITICAL: 0, HIGH: 0, NORMAL: 0, LOW: 0 },
       maxTokens: 0,
     };
   }
 
-  /**
-   * @param {Map<string, BodyAdapter>} bodies
-   * @param {object} [opts]
-   * @param {string} [opts.activeGoal]
-   * @param {string[]} [opts.history]
-   * @param {string} [opts.spaceName]
-   * @param {boolean} [opts.clearEventsAfterRead=true]
-   * @returns {object}
-   */
   aggregate(bodies, opts = {}) {
     this.stats.aggregations++;
     const now = Date.now();
@@ -48,19 +52,16 @@ class Aggregator {
       recent_history: (opts.history || []).slice(-this.maxHistory),
     };
 
-    // Snapshot every body
     for (const [name, body] of bodies) {
       const snap = typeof body.snapshot === "function" ? body.snapshot() : {};
       const compact = this._compactSnapshot(snap, now);
       out.bodies[name] = compact;
 
-      // Consume pending events after reading them (prevent replay)
       if (opts.clearEventsAfterRead !== false && typeof body.clearPendingEvents === "function") {
         body.clearPendingEvents();
       }
     }
 
-    // Enforce token budget
     const budgeted = this._enforceBudget(out);
 
     const size = this._tokenEstimate(budgeted);
@@ -79,17 +80,22 @@ class Aggregator {
     if (snap.mode) compact.mode = snap.mode;
     if (snap.last_action) compact.last_action = snap.last_action;
 
-    // Pending events: keep type and short payload summary
+    // Pending events: sort by priority (CRITICAL first) then cap.
+    // CRITICAL events always survive the per-body cap.
     if (Array.isArray(snap.pending_events) && snap.pending_events.length > 0) {
-      const events = snap.pending_events.slice(-this.maxPendingEventsPerBody);
-      compact.pending_events = events.map((e) => {
-        if (typeof e === "string") return e;
-        if (e && typeof e === "object") return e.type || "event";
-        return "event";
+      const sorted = [...snap.pending_events].sort(
+        (a, b) => priorityRank(a.priority) - priorityRank(b.priority)
+      );
+      const kept = this._capEventsByPriority(sorted, this.maxPendingEventsPerBody);
+      compact.pending_events = kept.map((e) => {
+        if (typeof e === "string") return { type: e, priority: "NORMAL" };
+        return {
+          type: e.type || "event",
+          priority: e.priority || "NORMAL",
+        };
       });
     }
 
-    // Staleness flag
     if (typeof snap.updated_at === "number") {
       const age = now - snap.updated_at;
       if (age > this.staleMs) {
@@ -98,7 +104,6 @@ class Aggregator {
       }
     }
 
-    // Remaining data fields (sensor readings, positions, etc.)
     for (const [k, v] of Object.entries(snap)) {
       if (["status", "mode", "last_action", "pending_events", "updated_at"].includes(k)) continue;
       compact[k] = this._compactValue(v);
@@ -107,10 +112,23 @@ class Aggregator {
     return compact;
   }
 
+  // Keep all CRITICAL events plus enough lower-priority events to fill cap
+  _capEventsByPriority(sortedEvents, cap) {
+    const critical = sortedEvents.filter((e) => (e.priority || "NORMAL") === "CRITICAL");
+    const rest = sortedEvents.filter((e) => (e.priority || "NORMAL") !== "CRITICAL");
+    const slotsLeft = Math.max(0, cap - critical.length);
+    const dropped = rest.slice(slotsLeft);
+    for (const e of dropped) {
+      this.stats.droppedEvents++;
+      const p = e.priority || "NORMAL";
+      this.stats.droppedByPriority[p] = (this.stats.droppedByPriority[p] || 0) + 1;
+    }
+    return [...critical, ...rest.slice(0, slotsLeft)];
+  }
+
   _compactValue(v) {
     if (v === null || v === undefined) return null;
     if (typeof v === "number") {
-      // Round floats to 3 decimals
       return Number.isInteger(v) ? v : Math.round(v * 1000) / 1000;
     }
     if (typeof v === "string") {
@@ -131,7 +149,7 @@ class Aggregator {
     return v;
   }
 
-  // -- Token budget enforcement --
+  // -- Token budget enforcement (priority-aware) --
 
   _tokenEstimate(obj) {
     try {
@@ -158,45 +176,87 @@ class Aggregator {
       out.recent_history = out.recent_history.slice(-5);
     }
 
-    // Step 2: drop pending_events from bodies
+    // Step 2: drop LOW priority events from every body
     if (this._tokenEstimate(out) > this.tokenBudget) {
-      for (const name of Object.keys(out.bodies)) {
-        const b = { ...out.bodies[name] };
-        delete b.pending_events;
-        out.bodies[name] = b;
-      }
+      this._dropEventsAtPriority(out, "LOW");
     }
 
-    // Step 3: drop non-essential fields from each body (keep only status + last_action)
+    // Step 3: drop NORMAL priority events
+    if (this._tokenEstimate(out) > this.tokenBudget) {
+      this._dropEventsAtPriority(out, "NORMAL");
+    }
+
+    // Step 4: drop HIGH priority events (last resort before dropping fields)
+    if (this._tokenEstimate(out) > this.tokenBudget) {
+      this._dropEventsAtPriority(out, "HIGH");
+    }
+
+    // Step 5: drop non-essential fields from each body.
+    // Keep status, last_action, and any remaining CRITICAL events.
     if (this._tokenEstimate(out) > this.tokenBudget) {
       for (const name of Object.keys(out.bodies)) {
         const b = out.bodies[name];
+        const criticalEvents = (b.pending_events || []).filter(
+          (e) => (e.priority || "NORMAL") === "CRITICAL"
+        );
         out.bodies[name] = {
           status: b.status,
           ...(b.last_action ? { last_action: b.last_action } : {}),
+          ...(criticalEvents.length > 0 ? { pending_events: criticalEvents } : {}),
           truncated: true,
         };
       }
     }
 
-    // Step 4: drop history entirely
+    // Step 6: drop history entirely
     if (this._tokenEstimate(out) > this.tokenBudget) {
       out.recent_history = [];
     }
 
-    // Step 5: drop bodies one at a time if still over budget
-    const bodyNames = Object.keys(out.bodies);
-    while (this._tokenEstimate(out) > this.tokenBudget && bodyNames.length > 0) {
-      const drop = bodyNames.pop();
-      delete out.bodies[drop];
+    // Step 7: drop bodies one at a time, starting with those that have no
+    // CRITICAL events. Bodies with CRITICAL events stay to the end.
+    if (this._tokenEstimate(out) > this.tokenBudget) {
+      const names = Object.keys(out.bodies);
+      const noCritical = names.filter((n) => {
+        const events = out.bodies[n].pending_events || [];
+        return !events.some((e) => (e.priority || "NORMAL") === "CRITICAL");
+      });
+      const withCritical = names.filter((n) => !noCritical.includes(n));
+      const dropOrder = [...noCritical, ...withCritical];
+
+      while (this._tokenEstimate(out) > this.tokenBudget && dropOrder.length > 0) {
+        const drop = dropOrder.shift();
+        delete out.bodies[drop];
+      }
     }
 
     return out;
   }
 
+  _dropEventsAtPriority(out, priority) {
+    for (const name of Object.keys(out.bodies)) {
+      const b = out.bodies[name];
+      if (!Array.isArray(b.pending_events)) continue;
+      const before = b.pending_events.length;
+      b.pending_events = b.pending_events.filter(
+        (e) => (e.priority || "NORMAL") !== priority
+      );
+      const dropped = before - b.pending_events.length;
+      if (dropped > 0) {
+        this.stats.droppedEvents += dropped;
+        this.stats.droppedByPriority[priority] =
+          (this.stats.droppedByPriority[priority] || 0) + dropped;
+      }
+      if (b.pending_events.length === 0) delete b.pending_events;
+    }
+  }
+
   getStats() {
-    return { ...this.stats };
+    return {
+      ...this.stats,
+      droppedByPriority: { ...this.stats.droppedByPriority },
+    };
   }
 }
 
-module.exports = { Aggregator };
+module.exports = { Aggregator, PRIORITY_RANK };
