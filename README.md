@@ -57,6 +57,20 @@ These three layers never overlap. Plexa is not a brain. It is a sequencer.
 
 ---
 
+## Transport truth
+
+| Hop | Mechanism | Latency |
+|------|-----------|---------|
+| Body -> Plexa | direct function call (in-process) | 0-1 ms |
+| Plexa -> LLM | HTTP (always remote) | ~500 ms |
+| Plexa -> Hardware body | HTTP (only when physically separate) | network round-trip |
+
+**Zero HTTP between body and Plexa.** That is the architectural guarantee.
+
+A body is a class. Tools are its async methods. Plexa calls `body.invokeTool(name, params)` directly. No serialization, no transport, no parsing. HTTP exists only at the LLM boundary and (optionally) when a body lives on a different machine.
+
+---
+
 ## Hello world
 
 ```bash
