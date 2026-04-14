@@ -9,6 +9,7 @@ const {
   Aggregator,
 } = require("./packages/core");
 const { OllamaBrain } = require("./packages/bridges/ollama");
+const { attachIntrospection } = require("./packages/core/introspection");
 
 module.exports = {
   Space,
@@ -20,4 +21,5 @@ module.exports = {
   Translator,
   Aggregator,
   OllamaBrain,
+  attachIntrospection,
 };

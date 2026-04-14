@@ -2,7 +2,7 @@
 // A CartpoleBody with pure-JS physics as a class with tool methods.
 // Plexa ticks it at 60fps, brain sees tool definitions, brain calls tools directly.
 
-const { Space, BodyAdapter, Brain, PRIORITY } = require("../..");
+const { Space, BodyAdapter, Brain, PRIORITY, attachIntrospection } = require("../..");
 const { OllamaBrain } = require("../../packages/bridges/ollama");
 
 // -- Pure JS cartpole physics (no MuJoCo, no Python) --
@@ -216,6 +216,10 @@ async function main() {
   }
 
   space.setGoal("balance the pole upright at the cart center\n");
+
+  // Expose localhost:4747 so the plexa CLI can show status / bodies / logs
+  attachIntrospection(space);
+  console.log(`[plexa] introspection on http://localhost:4747/plexa/status\n`);
 
   // Event hooks
   space.on("body_event", (e) => {

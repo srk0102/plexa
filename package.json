@@ -3,6 +3,9 @@
   "version": "0.3.0",
   "description": "Orchestration framework above SCP. One brain, many bodies.",
   "main": "index.js",
+  "bin": {
+    "plexa": "./bin/plexa"
+  },
   "exports": {
     ".": "./index.js",
     "./core": "./packages/core/index.js",
@@ -11,11 +14,13 @@
     "./core/brain": "./packages/core/brain.js",
     "./core/translator": "./packages/core/translator.js",
     "./core/aggregator": "./packages/core/aggregator.js",
-    "./bridges/ollama": "./packages/bridges/ollama.js"
+    "./bridges/ollama": "./packages/bridges/ollama.js",
+    "./introspection": "./packages/core/introspection.js"
   },
   "scripts": {
     "test": "node --test tests/plexa.test.js tests/managed-mode.test.js",
-    "hello": "node examples/hello-world/index.js"
+    "hello": "node examples/hello-world/index.js",
+    "cli": "node bin/plexa"
   },
   "keywords": [
     "embodied-ai",
@@ -39,6 +44,8 @@
   "files": [
     "index.js",
     "packages/",
+    "bin/",
+    "assets/logo/",
     "LICENSE",
     "README.md"
   ]

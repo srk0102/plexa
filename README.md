@@ -1,18 +1,34 @@
-<h1 align="center">Plexa</h1>
+<p align="center">
+  <img src="assets/logo/logo-full.svg" width="420" alt="Plexa"/>
+</p>
 
 <p align="center">
-  One brain. Many bodies.
+  <strong>One brain. Many bodies.</strong>
   <br/>
-  <strong>Orchestration framework for embodied AI systems.</strong>
+  Orchestration framework for embodied AI systems. Built on <a href="https://github.com/srk0102/SCP">scp-protocol</a>.
 </p>
 
 <p align="center">
   <a href="https://npmjs.com/package/@srk0102/plexa"><img src="https://img.shields.io/npm/v/@srk0102/plexa?color=4F46E5&label=npm" alt="npm"/></a>
   <a href="https://github.com/srk0102/plexa"><img src="https://img.shields.io/github/license/srk0102/plexa?color=818CF8" alt="license"/></a>
   <a href="https://github.com/srk0102/SCP"><img src="https://img.shields.io/badge/built%20on-scp--protocol-818CF8" alt="scp"/></a>
+  <a href="https://github.com/srk0102/plexa"><img src="https://img.shields.io/badge/tests-92%20passing-10B981" alt="tests"/></a>
 </p>
 
 > SCP gives AI one body. Plexa gives AI a whole body.
+
+---
+
+## Relationship to SCP
+
+| | scp-protocol | plexa |
+|---|---|---|
+| **Scope** | one body | many bodies under one brain |
+| **Role** | protocol + SDK | orchestration framework |
+| **Analogy** | LangChain for bodies | LangGraph for bodies |
+| **npm** | `scp-protocol` | `@srk0102/plexa` |
+
+Use SCP when you have one embodied agent. Use Plexa when you have several and want one LLM coordinating all of them.
 
 ---
 
@@ -196,24 +212,25 @@ plexa/
 
 ---
 
-## Relationship to SCP
+## CLI
 
-```
-SCP (scp-protocol)
-  Protocol + SDK
-  npm install scp-protocol
-  Controls one body
-  Done. Shipped. v0.1.1.
-
-Plexa
-  Orchestration framework
-  npm install @srk0102/plexa
-  Coordinates multiple SCP bodies
-  One brain for the whole body
-  Built on scp-protocol.
+```bash
+npx @srk0102/plexa version   # ✦ starfish + version
+npx @srk0102/plexa status    # running space + body health
+npx @srk0102/plexa bodies    # connected bodies with tools
+npx @srk0102/plexa logs      # live tail of events + tool calls
+npx @srk0102/plexa start ./space.js
 ```
 
-Same pattern as Express and Node HTTP. Plexa depends on scp-protocol. scp-protocol does not know about Plexa.
+Opt into the introspection server in your app:
+
+```javascript
+const { Space, attachIntrospection } = require("@srk0102/plexa")
+const space = new Space("my_robot", { tickHz: 60 })
+// ... addBody, setBrain ...
+attachIntrospection(space)   // exposes localhost:4747 for the CLI
+await space.run()
+```
 
 ---
 
