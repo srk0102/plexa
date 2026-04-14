@@ -1,6 +1,6 @@
 {
   "name": "@srk0102/plexa",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Orchestration framework above SCP. One brain, many bodies.",
   "main": "index.js",
   "exports": {
