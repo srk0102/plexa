@@ -1,236 +1,179 @@
-<p align="center">
-  <img src="assets/logo/logo-full.svg" width="420" alt="Plexa"/>
-</p>
+# @srk0102/plexa
 
-<p align="center">
-  <strong>One brain. Many bodies.</strong>
-  <br/>
-  Orchestration framework for embodied AI systems. Built on <a href="https://github.com/srk0102/SCP">scp-protocol</a>.
-</p>
+Orchestration framework for embodied AI. One LLM brain, many bodies, single-process tick loop.
 
-<p align="center">
-  <a href="https://npmjs.com/package/@srk0102/plexa"><img src="https://img.shields.io/npm/v/@srk0102/plexa?color=4F46E5&label=npm" alt="npm"/></a>
-  <a href="https://github.com/srk0102/plexa"><img src="https://img.shields.io/github/license/srk0102/plexa?color=818CF8" alt="license"/></a>
-  <a href="https://github.com/srk0102/SCP"><img src="https://img.shields.io/badge/built%20on-scp--protocol-818CF8" alt="scp"/></a>
-  <a href="https://github.com/srk0102/plexa"><img src="https://img.shields.io/badge/tests-92%20passing-10B981" alt="tests"/></a>
-</p>
+Plexa is built on [`scp-protocol`](https://www.npmjs.com/package/scp-protocol). Use `scp-protocol` directly when you have one body. Use Plexa when you have several bodies and want one LLM to coordinate them.
 
-> SCP gives AI one body. Plexa gives AI a whole body.
+```bash
+npm install @srk0102/plexa
+```
 
----
-
-## Relationship to SCP
-
-| | scp-protocol | plexa |
-|---|---|---|
-| **Scope** | one body | many bodies under one brain |
-| **Role** | protocol + SDK | orchestration framework |
-| **Analogy** | LangChain for bodies | LangGraph for bodies |
-| **npm** | `scp-protocol` | `@srk0102/plexa` |
-
-Use SCP when you have one embodied agent. Use Plexa when you have several and want one LLM coordinating all of them.
+Node >= 18. One production dependency: `scp-protocol`. Plexa's own core has no other runtime packages; everything else is `node:*` built-ins.
 
 ---
 
 ## What it does
 
-Plexa is an orchestration layer that sits above [SCP](https://github.com/srk0102/SCP). It coordinates multiple SCP adapters under a single LLM brain.
+- Runs a 60Hz reactor loop that ticks every registered body each frame.
+- Aggregates each body's state and events into a prompt that fits a configurable token budget (default 2000), trimming by event priority.
+- Calls a brain (OllamaBrain, or a subclass you write) at most every `brainIntervalMs`.
+- Validates the brain's tool intent against the body's declared schema, then dispatches as a direct async method call on the body.
+- Exposes an HTTP introspection server on port 4747 for the `plexa` CLI (status, bodies, logs).
 
-```
-LLM (Brain)
-    |
-Plexa (Orchestrator)
-    |
-Multiple SCP adapters (Body parts)
-    |
-Environment
-```
+It is a sequencer and a prompt packer, not a planner or a safety layer. The brain chooses the tool; Plexa only validates and dispatches it.
 
 ---
 
-## Four jobs only
-
-| Job | Where | What |
-|-----|-------|------|
-| Translate | `translator.js` | Convert LLM intent to SCP commands |
-| Sequence | `space.js` | Manage execution order across bodies |
-| Aggregate | `aggregator.js` | Compress all body state under 2000 tokens |
-| Gate | `body-adapter.js` | Enforce capabilities and safety contracts |
-
-No reasoning. No safety logic. No pattern matching. Four jobs only.
-
----
-
-## Decision authority
-
-```
-LLM decides:           WHAT (intent, goals)
-Plexa decides:     WHEN and HOW (sequencing, timing)
-SCP adapters decide:   WHETHER (safety veto, hardware limits)
-```
-
-These three layers never overlap. Plexa is not a brain. It is a sequencer.
-
----
-
-## Transport truth
-
-| Connection | Transport | Latency |
-|---|---|---|
-| JS Body -> Plexa | function call | 0 ms |
-| Python Body -> Plexa | HTTP | 1-5 ms |
-| Plexa -> LLM | HTTP | 500 ms+ |
-
-**Zero HTTP between JS bodies and Plexa.** HTTP only where physically necessary.
-
-A body is a class. Tools are its async methods. By default `transport = "inprocess"`, no port, no network. Plexa calls `body.invokeTool(name, params)` directly. To run a body in another process, mark it explicitly:
-
-```javascript
-class MuJoCoCartpole extends BodyAdapter {
-  static transport = "http"
-  static port = 8002
-}
-```
-
----
-
-## Hello world
+## Install
 
 ```bash
-git clone https://github.com/srk0102/plexa.git
-cd plexa
-npm install
-node examples/hello-world/index.js
+npm install @srk0102/plexa
 ```
 
-No AWS. No API key. Just Node.js.
+This pulls in `scp-protocol` as its sole dependency. No AWS, no API keys, no external services required to run the examples.
 
-Ollama optional: install from [ollama.ai](https://ollama.ai) and run `ollama pull llama3.2` for a real local brain. Otherwise the example uses a stub brain.
+To use a real LLM, install and run [Ollama](https://ollama.ai):
+
+```bash
+ollama pull llama3.2
+```
+
+If Ollama is not running, the bundled examples fall back to a stub brain so `npm run hello` still works end-to-end.
 
 ---
 
-## API
+## Quick start
 
 ```javascript
-const { Space, BodyAdapter, OllamaBrain } = require("@srk0102/plexa")
+const { Space, BodyAdapter, Brain } = require("@srk0102/plexa")
+const { OllamaBrain } = require("@srk0102/plexa/bridges/ollama")
 
 class CartpoleBody extends BodyAdapter {
   static bodyName = "cartpole"
   static tools = {
     apply_force: {
-      description: "push the cart",
+      description: "push the cart to balance the pole",
       parameters: {
-        direction: { type: "string", enum: ["left","right"], required: true },
+        direction: { type: "string", enum: ["left", "right"], required: true },
         magnitude: { type: "number", min: 0, max: 1, required: true },
       },
     },
+    hold: { description: "apply no force this frame", parameters: {} },
   }
-  async apply_force({ direction, magnitude }) {
-    // physics here
-  }
+
+  async apply_force({ direction, magnitude }) { /* physics */ }
+  async hold()                                { /* no-op */ }
+
   async tick() {
-    // sensor loop called by Plexa at tickHz
+    await super.tick()
+    // sensor read; populate body state visible to the brain prompt
+    this.setState({ pole_angle: readAngle() })
   }
 }
 
-const space = new Space("my_robot")
+const space = new Space("balancer", { tickHz: 60, brainIntervalMs: 1500 })
 space.addBody(new CartpoleBody())
 space.setBrain(new OllamaBrain({ model: "llama3.2" }))
-space.run()
+space.setGoal("balance the pole upright")
+await space.run()
 ```
 
-Tools are methods. No ports. No transport configuration. Plexa calls `body.invokeTool(...)` as a direct async call.
+Tools are methods. Bodies default to in-process; there is no port and no HTTP call between Plexa and a body in the same process. To run a body in another process, mark it `static transport = "http"` and give it a port.
+
+---
+
+## Run the bundled examples
+
+```bash
+git clone https://github.com/srk0102/plexa.git
+cd plexa
+npm install
+
+node examples/hello-world/index.js     # one body, one tool loop
+node examples/two-bodies/index.js      # cartpole + light, one brain
+node examples/inprocess-demo/index.js  # cartpole physics, full stats
+```
+
+Each example prints brain calls, tools dispatched, and final stats. All three run without Ollama by falling back to the stub brain.
+
+---
+
+## How the reactor works
+
+```
+                 brainIntervalMs
+                       |
+   body.tick() --> aggregator --> brain --> translator --> body.invokeTool()
+   body.tick()        (state +        |         (schema        (direct
+   body.tick()         events)        |          check)         async call)
+       ^                              |
+       +------------------------------+
+                 tickHz loop
+```
+
+Single thread. `setTimeout`-based tick. No locks. The brain call is async and non-blocking; body ticks continue while the brain is in flight. If the brain is still running when the next brain window opens, it is skipped.
 
 ---
 
 ## Managed mode
 
-Connected bodies flip to `managed` mode automatically. Managed does NOT mean dumb.
+When a body is added to a Space it is in `managed` mode. Managed does not mean the body is dumb.
 
-| Mode | LLM layer | Pattern store | Reflexes | Reports |
-|------|-----------|--------------|----------|---------|
-| **standalone** | Body calls its own LLM | Local decisions | Local | — |
-| **managed** | Plexa owns the LLM | **Local decisions (still intelligent)** | Local | Body pings Space on every decision |
+| Mode         | Who calls the LLM | Body's pattern store | Body's reflexes |
+|--------------|-------------------|----------------------|-----------------|
+| standalone   | the body          | used                 | fire            |
+| managed      | Plexa             | still used           | still fire      |
 
-In managed mode:
-- The body keeps using its local pattern store to decide at muscle speed.
-- Every local decision fires `space.onBodyDecision(name, entity, decision, meta)` so Plexa can build vertical memory and stay aware.
-- Only the LLM path is routed through Plexa.
-
-Managed = coordinated, not lobotomized.
+In managed mode the body continues to resolve decisions locally via its own `scp-protocol` pattern store and fires a `body_decision` event to Plexa for each one. Plexa observes; it does not override.
 
 ---
 
-## Architecture
+## Tool intent contract
 
-```
-Read sensors in SCP muscle
-  |
-Reflex check (always local, fastest)
-  |
-Emit event UP via HTTP to Plexa
-  |
-Space aggregator compresses state from all bodies
-  |
-Space calls LLM brain (fire-and-forget, async)
-  |
-Brain returns intent
-  |
-Translator validates intent against body capabilities
-  |
-Space dispatches command DOWN to body
-  |
-Body forwards command to SCP muscle via HTTP
-  |
-SCP muscle executes command
+A brain response must be valid JSON matching:
+
+```json
+{
+  "target_body": "cartpole",
+  "tool": "apply_force",
+  "parameters": { "direction": "left", "magnitude": 0.4 },
+  "priority": 3,
+  "fallback": "hold"
+}
 ```
 
-Single-threaded reactor at 120Hz. No locks. No polling. Deterministic tick budget.
+The translator rejects intents for seven reasons: unknown body, unknown tool, missing required parameter, wrong type, value out of range, value not in enum, or malformed response. Each rejection is counted in `space.getStats().translator.byReason`.
 
 ---
 
-## Package structure
+## Event priority
 
-```
-plexa/
-  packages/
-    core/
-      space.js          Space orchestrator
-      body-adapter.js   BodyAdapter base class
-      brain.js          Brain base class
-      translator.js     Intent -> command validation
-      aggregator.js     State compression with token budget
-    bridges/
-      ollama.js         OllamaBrain (local, free)
-  adapters/
-    template/           Minimal SCP adapter for testing
-  examples/
-    hello-world/        End-to-end demo
-  tests/
-    plexa.test.js       43 tests, 0 failures
-```
+Bodies emit events with one of four priorities: `CRITICAL`, `HIGH`, `NORMAL`, `LOW`. The aggregator walks a seven-step reduction cascade when the prompt approaches the token budget: float compaction, string truncation, drop stale body fields, drop LOW events, drop NORMAL events, drop HIGH events, and finally drop bodies. CRITICAL events are preserved at every step.
 
 ---
 
 ## CLI
 
+Installed globally or via `npx`:
+
 ```bash
-npx @srk0102/plexa version   # ✦ starfish + version
-npx @srk0102/plexa status    # running space + body health
-npx @srk0102/plexa bodies    # connected bodies with tools
-npx @srk0102/plexa logs      # live tail of events + tool calls
+npx @srk0102/plexa version     # version string
+npx @srk0102/plexa status      # running space, tick, brain stats
+npx @srk0102/plexa bodies      # connected bodies and tool lists
+npx @srk0102/plexa logs        # live tail of body events and tool calls
 npx @srk0102/plexa start ./space.js
 ```
 
-Opt into the introspection server in your app:
+The CLI reads from an HTTP server on port 4747. To expose it from your app:
 
 ```javascript
 const { Space, attachIntrospection } = require("@srk0102/plexa")
-const space = new Space("my_robot", { tickHz: 60 })
-// ... addBody, setBrain ...
-attachIntrospection(space)   // exposes localhost:4747 for the CLI
+const space = new Space("robot")
+attachIntrospection(space)   // localhost:4747/plexa/{status,bodies,logs,health}
 await space.run()
 ```
+
+No dependencies beyond `node:http`. No bearer-token auth yet: treat the port as localhost-only.
 
 ---
 
@@ -240,38 +183,47 @@ await space.run()
 npm test
 ```
 
-43 tests. Zero external deps beyond `scp-protocol`. `node:test` built-in.
+92 tests across 14 suites. Built-in `node:test`, no test framework dependency.
 
-| Suite | Tests |
-|-------|-------|
-| Space lifecycle | 7 |
-| BodyAdapter modes | 7 |
-| BodyAdapter execute | 4 |
-| Brain | 7 |
-| OllamaBrain | 3 |
-| Translator | 8 |
-| Aggregator | 6 |
+| File                | Tests |
+|---------------------|------:|
+| plexa.test.js       | 82 |
+| managed-mode.test.js| 10 |
+
+The test suite covers Space lifecycle, addBody transport validation, reactor loop, Aggregator priority trimming, Translator rejection reasons, Brain base class, and managed-mode decision handoff. It does not cover: CLI, introspection server, or the bundled examples. Those are exercised by running them manually.
 
 ---
 
-## Roadmap
+## Honest state of the code
 
-| Version | What |
-|---------|------|
-| v0.1.0 (current) | Space, BodyAdapter, Brain, Translator, Aggregator, OllamaBrain, template muscle |
-| v0.2.0 | Multi-body demos (MuJoCo cartpole + template + arm), real Ollama integration |
-| v0.3.0 | Safety layer with CRDT shared state, SPSC ring buffers |
-| v0.4.0 | Process isolation per body, OpenAI and Anthropic bridges |
-| v1.0.0 | Stable API, production-ready orchestration |
+What works:
+- In-process bodies. `examples/inprocess-demo` and both updated `hello-world` / `two-bodies` examples run end to end.
+- Aggregator with CRITICAL-preserving trim cascade.
+- Translator with per-parameter type / enum / min / max / required validation.
+- Ollama bridge over raw `node:http`.
+- CLI with colored output, spinner, and panel rendering using only `node:*`.
+
+What exists but has a caveat:
+- `NetworkBodyAdapter` proxies tool calls to a remote body over HTTP, but `Space.addBody` does not yet auto-wrap HTTP-transport bodies in it. You have to instantiate the proxy yourself.
+- Introspection server is unauthenticated. Bind to localhost only.
+- The bundled `scp-protocol` dependency is pinned to `^0.3.0`; the two packages are developed together.
+
+What is not implemented yet:
+- CRDT or shared state between bodies.
+- Body-to-body lateral events.
+- Persistent vertical memory across sessions. The current `body_decision` history is in-memory and bounded to the last 10 entries.
+- Safety gate that validates LLM intents against policy before dispatch.
+- Process isolation per body. Bodies share the Node process.
+- Retry and cost tracking in the Brain base class.
 
 ---
 
 ## Links
 
-- **SCP:** https://github.com/srk0102/SCP
-- **SCP npm:** https://npmjs.com/package/scp-protocol
-- **SCP docs:** https://srk-e37e8aa3.mintlify.app
+- Source: https://github.com/srk0102/plexa
+- npm: https://npmjs.com/package/@srk0102/plexa
+- SCP protocol: https://npmjs.com/package/scp-protocol
 
 ## License
 
-[MIT](LICENSE) -- [srk0102](https://github.com/srk0102)
+MIT
