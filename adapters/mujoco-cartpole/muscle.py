@@ -30,8 +30,27 @@ from urllib.parse import urlparse
 MODEL_PATH = os.path.join(os.path.dirname(__file__), "cartpole.xml")
 PATTERN_FILE = os.path.join(os.path.dirname(__file__), "patterns.json")
 
-# Config
-MUSCLE_PORT = int(os.environ.get("SCP_PORT", "8002"))
+# Body declaration -- mirrors the JS side
+# Plexa reads TRANSPORT and PORT to decide network mode.
+class CartpoleBody:
+    BODY_NAME = "cartpole"
+    TRANSPORT = "http"   # explicit -- this body lives in another process
+    PORT = 8002          # explicit -- where its HTTP server listens
+    TOOLS = {
+        "apply_force": {
+            "description": "Apply force to the cart",
+            "parameters": {
+                "direction": {"type": "string", "enum": ["left", "right"], "required": True},
+                "magnitude": {"type": "number", "min": 0, "max": 1, "required": True},
+            },
+        },
+        "reset": {"description": "Reset cartpole", "parameters": {}},
+        "hold":  {"description": "Apply no force", "parameters": {}},
+    }
+
+
+# Config (network bodies must declare port + space URL)
+MUSCLE_PORT = int(os.environ.get("SCP_PORT", str(CartpoleBody.PORT)))
 SPACE_URL = os.environ.get("SPACE_URL", "http://localhost:3000")
 BODY_NAME = os.environ.get("BODY_NAME", "cartpole")
 
@@ -139,9 +158,10 @@ def force_from_decision(decision):
 
 
 def force_from_command(cmd):
-    """Convert Plexa command into force applied to cart."""
-    action = cmd.get("method") or cmd.get("action") or ""
-    args = cmd.get("args") or cmd.get("parameters") or {}
+    """Convert Plexa command into force applied to cart.
+    Accepts: tool / method / action (in priority order)."""
+    action = cmd.get("tool") or cmd.get("method") or cmd.get("action") or ""
+    args = cmd.get("parameters") or cmd.get("args") or {}
 
     if action == "apply_force":
         direction = args.get("direction", "right")
@@ -199,6 +219,14 @@ def make_handler(rt):
                 return self._reply(200, {"mode": rt.mode, "body": BODY_NAME})
             if self.path == "/health":
                 return self._reply(200, {"status": "ok", "body": BODY_NAME, "mode": rt.mode})
+            if self.path == "/discover":
+                # Plexa uses this to read tools + transport metadata
+                return self._reply(200, {
+                    "name": CartpoleBody.BODY_NAME,
+                    "transport": CartpoleBody.TRANSPORT,
+                    "port": CartpoleBody.PORT,
+                    "tools": CartpoleBody.TOOLS,
+                })
             self._reply(404, {"error": "not found"})
 
         def do_POST(self):
@@ -219,7 +247,8 @@ def make_handler(rt):
                 print(f"[cartpole] mode -> {rt.mode}")
                 return self._reply(200, {"ok": True, "mode": rt.mode})
 
-            if t == "command":
+            # Accept both legacy "command" and new "tool_call"
+            if t in ("command", "tool_call"):
                 with rt.lock:
                     rt.pending_command = msg
                     rt.stats["commands_received"] += 1

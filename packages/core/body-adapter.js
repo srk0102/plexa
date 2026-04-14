@@ -1,34 +1,46 @@
-// BodyAdapter -- a body whose methods are tools the brain can call directly.
+// BodyAdapter -- a body whose methods are tools the brain can call.
 //
-// Zero HTTP by default. The body lives in the same process as Space.
-// Subclasses declare tools as async methods and describe them via static tools.
-// Space discovers tools on addBody() and routes LLM tool calls as direct method
-// invocations -- no text parsing, no transport indirection.
+// By DEFAULT, a body is INPROCESS:
+//   - No port. No transport configuration. No HTTP server.
+//   - Plexa calls body.invokeTool(name, params) as a direct async method call.
 //
-// Event priority levels (higher priority dropped last by Aggregator):
-//   CRITICAL  never trimmed
-//   HIGH      trimmed only under severe budget pressure
-//   NORMAL    default
-//   LOW       trimmed first
+// To run a body in another process (Python MuJoCo, hardware, ROS2),
+// mark it explicitly via static fields:
+//
+//   class MuJoCoCartpole extends BodyAdapter {
+//     static transport = "http";
+//     static port = 8002;
+//     static host = "localhost";
+//   }
+//
+// Plexa reads these on addBody() and uses HTTP to reach the body.
+// Same developer API either way:
+//   space.addBody(new CartpoleJS())   // inprocess -- direct calls
+//   space.addBody(new CartpolePy())   // network   -- HTTP under the hood
+//
+// Aliased as SCPBody since this matches the v0.2 SCP body contract.
 
-const PRIORITY = {
-  CRITICAL: 0,
-  HIGH: 1,
-  NORMAL: 2,
-  LOW: 3,
-};
+const PRIORITY = { CRITICAL: 0, HIGH: 1, NORMAL: 2, LOW: 3 };
 const VALID_PRIORITIES = new Set(Object.keys(PRIORITY));
 
 class BodyAdapter {
-  /**
-   * @param {object} [opts]
-   * @param {string} [opts.name] - optional override of class default
-   */
   constructor(opts = {}) {
-    // Name resolution: opts.name > static name > class name
-    this.name = opts.name || this.constructor.bodyName || this.constructor.name;
-    if (!this.name) {
-      throw new Error("BodyAdapter: body must have a name");
+    const Class = this.constructor;
+
+    this.name = opts.name || Class.bodyName || Class.name;
+    if (!this.name) throw new Error("BodyAdapter: name required");
+
+    // Transport defaults to inprocess. Network is OPT-IN.
+    this.transport = opts.transport || Class.transport || "inprocess";
+    if (this.transport !== "inprocess" && this.transport !== "http") {
+      throw new Error(`${this.name}: invalid transport "${this.transport}"`);
+    }
+
+    this.host = opts.host || Class.host || null;
+    this.port = opts.port || Class.port || null;
+
+    if (this.transport === "http" && !this.port) {
+      throw new Error(`${this.name}: transport=http requires a port`);
     }
 
     this.space = null;
@@ -50,34 +62,24 @@ class BodyAdapter {
     };
   }
 
-  // -- Tool discovery (for Space) --
+  // -- Tool discovery --
 
-  static tools = {}; // subclass overrides with { toolName: { description, parameters } }
+  static tools = {};
 
-  getToolDefinitions() {
-    return this.constructor.tools || {};
-  }
+  getToolDefinitions() { return this.constructor.tools || {}; }
 
   /**
-   * Space calls this to execute a tool by name.
-   * Returns the method result or throws if unknown / not a function.
+   * Direct tool invocation. Used by Plexa for inprocess bodies.
+   * Plexa wraps this in NetworkBodyAdapter when transport="http".
    */
   async invokeTool(toolName, parameters = {}) {
     const tools = this.getToolDefinitions();
-    if (!tools[toolName]) {
-      throw new Error(`${this.name}: unknown tool "${toolName}"`);
-    }
+    if (!tools[toolName]) throw new Error(`${this.name}: unknown tool "${toolName}"`);
     const fn = this[toolName];
-    if (typeof fn !== "function") {
-      throw new Error(`${this.name}: tool "${toolName}" declared but no method`);
-    }
+    if (typeof fn !== "function") throw new Error(`${this.name}: tool "${toolName}" declared but no method`);
     this.stats.toolCalls++;
-    try {
-      return await fn.call(this, parameters || {});
-    } catch (e) {
-      this.stats.toolErrors++;
-      throw e;
-    }
+    try { return await fn.call(this, parameters || {}); }
+    catch (e) { this.stats.toolErrors++; throw e; }
   }
 
   // -- Space attachment --
@@ -90,10 +92,7 @@ class BodyAdapter {
     this._setMode("managed");
   }
 
-  _detachSpace() {
-    this.space = null;
-    this._setMode("standalone");
-  }
+  _detachSpace() { this.space = null; this._setMode("standalone"); }
 
   _setMode(mode) {
     if (mode !== "standalone" && mode !== "managed") {
@@ -104,28 +103,17 @@ class BodyAdapter {
     this._state.updated_at = Date.now();
   }
 
-  // -- Lifecycle hooks (override in subclass) --
+  // -- Lifecycle hooks --
 
-  async onConfigure() {
-    this._setStatus("configured");
-  }
-
-  async onActivate() {
-    this._setStatus("active");
-  }
-
-  async onEmergencyStop() {
-    this._setStatus("stopped");
-  }
+  async onConfigure() { this._setStatus("configured"); }
+  async onActivate()  { this._setStatus("active"); }
+  async onEmergencyStop() { this._setStatus("stopped"); }
 
   /**
-   * Sensor loop. Called by Space at tickHz.
-   * Override in subclass to read sensors, check reflexes, emit events.
-   * Default: no-op.
+   * Sensor loop. Called by Space at tickHz for inprocess bodies.
+   * For network bodies, the body's own process runs the tick loop.
    */
-  async tick() {
-    this.stats.ticks++;
-  }
+  async tick() { this.stats.ticks++; }
 
   // -- State --
 
@@ -133,6 +121,7 @@ class BodyAdapter {
     return {
       status: this._state.status,
       mode: this._state.mode,
+      transport: this.transport,
       pending_events: [...this._state.pending_events],
       updated_at: this._state.updated_at,
       ...this._state.data,
@@ -149,24 +138,11 @@ class BodyAdapter {
     this._state.updated_at = Date.now();
   }
 
-  /**
-   * Emit a semantic event. Pushed directly to Space (no HTTP).
-   * @param {string} eventType
-   * @param {object} [payload]
-   * @param {string} [priority] CRITICAL | HIGH | NORMAL | LOW
-   */
   emit(eventType, payload = {}, priority = "NORMAL") {
     if (!VALID_PRIORITIES.has(priority)) priority = "NORMAL";
-
-    this._state.pending_events.push({
-      type: eventType,
-      payload,
-      priority,
-      ts: Date.now(),
-    });
+    this._state.pending_events.push({ type: eventType, payload, priority, ts: Date.now() });
     this.stats.events++;
 
-    // Preserve CRITICAL past queue cap
     if (this._state.pending_events.length > 20) {
       const recent = this._state.pending_events.slice(-20);
       const droppedCritical = this._state.pending_events
@@ -180,9 +156,10 @@ class BodyAdapter {
     }
   }
 
-  clearPendingEvents() {
-    this._state.pending_events = [];
-  }
+  clearPendingEvents() { this._state.pending_events = []; }
 }
 
-module.exports = { BodyAdapter, PRIORITY };
+// SCPBody is the same class. Two names for the same contract.
+const SCPBody = BodyAdapter;
+
+module.exports = { BodyAdapter, SCPBody, PRIORITY };

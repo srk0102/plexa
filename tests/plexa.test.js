@@ -235,6 +235,111 @@ describe("BodyAdapter tools", () => {
   });
 });
 
+// ============================================================
+// Transport contract: zero-port default, explicit network opt-in
+// ============================================================
+
+describe("BodyAdapter transport", () => {
+  test("default transport is inprocess", () => {
+    const b = new TestBody();
+    assert.strictEqual(b.transport, "inprocess");
+  });
+
+  test("default port is null (no port for inprocess bodies)", () => {
+    const b = new TestBody();
+    assert.strictEqual(b.port, null);
+  });
+
+  test("default host is null (no host for inprocess bodies)", () => {
+    const b = new TestBody();
+    assert.strictEqual(b.host, null);
+  });
+
+  test("snapshot includes transport for the brain to see", () => {
+    const b = new TestBody();
+    assert.strictEqual(b.snapshot().transport, "inprocess");
+  });
+
+  test("transport=http requires explicit port", () => {
+    class NetBody extends BodyAdapter {
+      static transport = "http";
+      // missing port
+    }
+    assert.throws(() => new NetBody(), { message: /requires a port/ });
+  });
+
+  test("transport=http with port allowed", () => {
+    class NetBody extends BodyAdapter {
+      static bodyName = "remote";
+      static transport = "http";
+      static port = 9999;
+    }
+    const b = new NetBody();
+    assert.strictEqual(b.transport, "http");
+    assert.strictEqual(b.port, 9999);
+  });
+
+  test("invalid transport rejected", () => {
+    class BadBody extends BodyAdapter {
+      static transport = "carrier_pigeon";
+    }
+    assert.throws(() => new BadBody(), { message: /invalid transport/ });
+  });
+
+  test("Space emits body_registered with transport metadata", () => {
+    const s = new Space("t");
+    let event = null;
+    s.on("body_registered", (e) => { event = e; });
+    s.addBody(new TestBody());
+    assert.ok(event);
+    assert.strictEqual(event.transport, "inprocess");
+    assert.strictEqual(event.port, null);
+    assert.deepStrictEqual(event.tools.sort(), ["count", "ping", "say"]);
+  });
+});
+
+describe("SCPBody alias", () => {
+  test("SCPBody is the same class as BodyAdapter", () => {
+    const { SCPBody } = require("..");
+    assert.strictEqual(SCPBody, BodyAdapter);
+  });
+
+  test("Plexa exports NetworkBodyAdapter", () => {
+    const { NetworkBodyAdapter } = require("..");
+    assert.strictEqual(typeof NetworkBodyAdapter, "function");
+  });
+});
+
+describe("NetworkBodyAdapter", () => {
+  const { NetworkBodyAdapter } = require("..");
+
+  test("requires name and port", () => {
+    assert.throws(() => new NetworkBodyAdapter({ name: "x" }), { message: /port required/ });
+    assert.throws(() => new NetworkBodyAdapter({ port: 9999 }), { message: /name required/ });
+  });
+
+  test("transport is http", () => {
+    const b = new NetworkBodyAdapter({ name: "remote", port: 9999, tools: { ping: {} } });
+    assert.strictEqual(b.transport, "http");
+    assert.strictEqual(b.port, 9999);
+    assert.strictEqual(b.host, "localhost");
+  });
+
+  test("getToolDefinitions returns dynamic tools", () => {
+    const b = new NetworkBodyAdapter({
+      name: "remote",
+      port: 9999,
+      tools: { foo: { description: "x" } },
+    });
+    assert.ok(b.getToolDefinitions().foo);
+  });
+
+  test("invokeTool rejects unknown tool", async () => {
+    const b = new NetworkBodyAdapter({ name: "remote", port: 9999, tools: { ping: {} } });
+    await assert.rejects(() => b.invokeTool("nope"), { message: /unknown tool/ });
+  });
+});
+
 describe("BodyAdapter modes", () => {
   test("default mode is standalone", () => {
     assert.strictEqual(new TestBody().mode, "standalone");

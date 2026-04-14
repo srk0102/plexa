@@ -179,6 +179,23 @@ async function main() {
   });
 
   const body = new CartpoleBody();
+
+  // ZERO-PORT GUARANTEE: prove this body has no transport configuration
+  console.log(`[plexa] body class:        ${body.constructor.name}`);
+  console.log(`[plexa] body transport:    ${body.transport}`);
+  console.log(`[plexa] body port:         ${body.port === null ? "(none -- inprocess)" : body.port}`);
+  console.log(`[plexa] body host:         ${body.host === null ? "(none -- inprocess)" : body.host}`);
+
+  if (body.transport !== "inprocess" || body.port !== null) {
+    throw new Error("FAIL: this demo expects a pure inprocess body. Found transport=" + body.transport);
+  }
+
+  space.on("body_registered", (e) => {
+    console.log(`[plexa] registered "${e.name}" via ${e.transport}` +
+      (e.port ? ` (port ${e.port})` : "") +
+      ` -- tools: ${e.tools.join(", ")}`);
+  });
+
   space.addBody(body);
 
   const ollamaUp = await OllamaBrain.isAvailable();
@@ -190,12 +207,7 @@ async function main() {
     space.setBrain(new StubBrain());
   }
 
-  space.setGoal("balance the pole upright at the cart center");
-
-  // Log tools discovered
-  const tools = space.getTools();
-  console.log(`[plexa] CartpoleBody connected (inprocess)`);
-  console.log(`[plexa] tools: ${tools.map((t) => t.tool).join(", ")}\n`);
+  space.setGoal("balance the pole upright at the cart center\n");
 
   // Event hooks
   space.on("body_event", (e) => {

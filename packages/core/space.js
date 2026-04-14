@@ -63,6 +63,10 @@ class Space extends EventEmitter {
     if (this.bodies.has(adapter.name)) {
       throw new Error(`Space.addBody: body "${adapter.name}" already registered`);
     }
+
+    // Inspect transport: inprocess (default) or http (explicit network body).
+    const transport = adapter.transport || "inprocess";
+
     adapter._attachSpace(this);
     this.bodies.set(adapter.name, adapter);
 
@@ -74,6 +78,13 @@ class Space extends EventEmitter {
     for (const [toolName, def] of Object.entries(tools)) {
       this.toolRegistry.set(`${adapter.name}.${toolName}`, { body: adapter, tool: toolName, def });
     }
+
+    this.emit("body_registered", {
+      name: adapter.name,
+      transport,
+      port: adapter.port || null,
+      tools: Object.keys(tools),
+    });
 
     return this;
   }
