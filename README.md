@@ -1,6 +1,34 @@
-# @srk0102/plexa
+<p align="center">
+  <img src="https://raw.githubusercontent.com/srk0102/plexa/master/assets/logo/logo-full.svg" width="420" alt="Plexa"/>
+</p>
 
-Orchestration framework for embodied AI. One LLM brain, many bodies, single-process tick loop.
+<p align="center">
+  <strong>One brain. Many bodies.</strong>
+  <br/>
+  Orchestration framework for embodied AI. Built on
+  <a href="https://www.npmjs.com/package/scp-protocol">scp-protocol</a>.
+</p>
+
+<p align="center">
+  <a href="https://npmjs.com/package/@srk0102/plexa"><img src="https://img.shields.io/npm/v/@srk0102/plexa?color=4F46E5&label=npm" alt="npm"/></a>
+  <a href="https://github.com/srk0102/plexa"><img src="https://img.shields.io/github/license/srk0102/plexa?color=818CF8" alt="license"/></a>
+  <a href="https://github.com/srk0102/plexa"><img src="https://img.shields.io/badge/tests-92%20passing-10B981" alt="tests"/></a>
+  <a href="https://github.com/srk0102/SCP"><img src="https://img.shields.io/badge/built%20on-scp--protocol-818CF8" alt="scp-protocol"/></a>
+</p>
+
+---
+
+## Demo: one brain, cart-pole body
+
+[![Watch the demo](https://res.cloudinary.com/still-studying/video/upload/so_3/Screen_Recording_2026-04-13_010202_qlnftl.jpg)](https://res.cloudinary.com/still-studying/video/upload/Screen_Recording_2026-04-13_010202_qlnftl.mp4)
+
+Plexa ticks the body at 60Hz, the body consults its local pattern cache first, and the LLM brain is called only when the cache misses.
+
+---
+
+## Overview
+
+Plexa runs a single-process tick loop, aggregates every body's state into a brain prompt, dispatches the brain's tool intent as a direct async method call on the body.
 
 Plexa is built on [`scp-protocol`](https://www.npmjs.com/package/scp-protocol). Use `scp-protocol` directly when you have one body. Use Plexa when you have several bodies and want one LLM to coordinate them.
 
