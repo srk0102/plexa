@@ -1,0 +1,1 @@
+{"angle_bucket:0.0|off_center:center|tilting:steady": {"decision": "light_left", "count": 1}, "angle_bucket:-0.25|off_center:center|tilting:left": {"decision": "light_left", "count": 1}, "angle_bucket:0.0|off_center:center|tilting:left": {"decision": "light_right", "count": 2}, "angle_bucket:-0.5|off_center:center|tilting:left": {"decision": "light_left", "count": 1}}

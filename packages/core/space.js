@@ -1,6 +1,9 @@
-// Space -- orchestrator that coordinates multiple SCP bodies with one brain
+// Space -- orchestrator that coordinates multiple bodies with one brain.
 // Four jobs only: translate, sequence, aggregate, gate.
-// No reasoning. No safety logic. No pattern matching.
+//
+// Bodies are in-process objects. Tools are their async methods.
+// LLM tool calls dispatch directly as method invocations. Zero HTTP,
+// zero text parsing. HTTP lives only between Plexa and the LLM.
 
 const { EventEmitter } = require("node:events");
 const { Translator } = require("./translator");
@@ -8,28 +11,29 @@ const { Aggregator } = require("./aggregator");
 
 class Space extends EventEmitter {
   /**
-   * @param {string} name - identifier for this Space
+   * @param {string} name
    * @param {object} [opts]
-   * @param {number} [opts.tickHz] - reactor tick rate, default 120
-   * @param {number} [opts.aggregateEveryTicks] - aggregate state every N ticks
-   * @param {number} [opts.brainIntervalMs] - min ms between brain calls, default 2000
-   * @param {number} [opts.tokenBudget] - aggregator token budget, default 2000
-   * @param {Set<string>} [opts.allowedActions] - optional global action allowlist
+   * @param {number} [opts.tickHz] reactor rate, default 60
+   * @param {number} [opts.aggregateEveryTicks] aggregate cadence, default 30
+   * @param {number} [opts.brainIntervalMs] min ms between brain calls, default 2000
+   * @param {number} [opts.tokenBudget] aggregator budget, default 2000
+   * @param {Set<string>} [opts.allowedTools] optional "body.tool" allowlist
    */
   constructor(name, opts = {}) {
     super();
     this.name = name;
-    this.tickHz = opts.tickHz || 120;
+    this.tickHz = opts.tickHz || 60;
     this.aggregateEveryTicks = opts.aggregateEveryTicks || 30;
     this.brainIntervalMs = opts.brainIntervalMs || 2000;
 
     this.bodies = new Map();
+    this.toolRegistry = new Map(); // "body.tool" -> { body, tool, def }
     this.brain = null;
     this.activeGoal = null;
     this.history = [];
     this.historyCap = 10;
 
-    this.translator = new Translator({ allowedActions: opts.allowedActions });
+    this.translator = new Translator({ allowedTools: opts.allowedTools });
     this.aggregator = new Aggregator({ tokenBudget: opts.tokenBudget });
 
     this._running = false;
@@ -42,9 +46,11 @@ class Space extends EventEmitter {
       brainCalls: 0,
       brainErrors: 0,
       ticks: 0,
+      tickErrors: 0,
       aggregations: 0,
-      commandsDispatched: 0,
-      commandsRejected: 0,
+      toolsDispatched: 0,
+      toolsRejected: 0,
+      toolErrors: 0,
     };
   }
 
@@ -59,6 +65,16 @@ class Space extends EventEmitter {
     }
     adapter._attachSpace(this);
     this.bodies.set(adapter.name, adapter);
+
+    // Discover tools and build registry
+    const tools = typeof adapter.getToolDefinitions === "function"
+      ? adapter.getToolDefinitions()
+      : (adapter.constructor && adapter.constructor.tools) || {};
+
+    for (const [toolName, def] of Object.entries(tools)) {
+      this.toolRegistry.set(`${adapter.name}.${toolName}`, { body: adapter, tool: toolName, def });
+    }
+
     return this;
   }
 
@@ -101,11 +117,10 @@ class Space extends EventEmitter {
     for (const body of this.bodies.values()) {
       try { await body.onEmergencyStop(); } catch {}
     }
-
     this.emit("stopped");
   }
 
-  // -- Reactor --
+  // -- Reactor: ticks every body, dispatches brain responses, calls brain at interval --
 
   async _reactorLoop() {
     const tickMs = 1000 / this.tickHz;
@@ -115,13 +130,23 @@ class Space extends EventEmitter {
       this._tick++;
       this.stats.ticks++;
 
-      // Drain brain responses
+      // 1. Tick every body (direct async method calls -- zero network)
+      for (const body of this.bodies.values()) {
+        try {
+          await body.tick();
+        } catch (e) {
+          this.stats.tickErrors++;
+          this.emit("tick_error", { body: body.name, error: e.message });
+        }
+      }
+
+      // 2. Drain queued brain tool calls
       while (this._brainResponseQueue.length > 0) {
         const intent = this._brainResponseQueue.shift();
         this._dispatchIntent(intent);
       }
 
-      // Aggregate + brain call at interval
+      // 3. Maybe call brain
       if (this._tick % this.aggregateEveryTicks === 0) {
         const now = Date.now();
         if (!this._brainInFlight && now - this._lastBrainCallAt >= this.brainIntervalMs) {
@@ -131,7 +156,7 @@ class Space extends EventEmitter {
 
       const elapsed = Date.now() - tickStart;
       const wait = Math.max(0, tickMs - elapsed);
-      if (wait > 0) await new Promise(r => setTimeout(r, wait));
+      if (wait > 0) await new Promise((r) => setTimeout(r, wait));
     }
   }
 
@@ -159,38 +184,41 @@ class Space extends EventEmitter {
     }
   }
 
-  // -- Intent dispatch (translator + sequencer) --
+  // -- Tool dispatch: structured intent -> direct method call --
 
   _dispatchIntent(intent) {
     const result = this.translator.translate(intent, this.bodies);
 
     if (!result.ok) {
-      this.stats.commandsRejected++;
+      this.stats.toolsRejected++;
       this.emit("intent_error", { intent, reason: result.reason, error: result.error });
       return;
     }
 
-    const command = result.command;
-    const body = this.bodies.get(command.body);
+    const { body: bodyName, tool, parameters } = result.command;
+    const body = this.bodies.get(bodyName);
 
-    this.stats.commandsDispatched++;
-    this._addToHistory(`${command.body}: ${command.action}`);
+    this.stats.toolsDispatched++;
+    this._addToHistory(`${bodyName}.${tool}`);
 
-    body.execute({
-      action: command.action,
-      parameters: command.parameters,
-      priority: command.priority,
-      fallback: command.fallback,
-    }).catch((e) => {
-      this.emit("execute_error", { command, error: e.message });
-    });
+    // Direct async method call -- no HTTP, no serialization round-trip
+    const start = Date.now();
+    body.invokeTool(tool, parameters)
+      .then((value) => {
+        const dur = Date.now() - start;
+        this.emit("tool_dispatched", { body: bodyName, tool, parameters, value, durationMs: dur });
+      })
+      .catch((e) => {
+        this.stats.toolErrors++;
+        this.emit("tool_error", { body: bodyName, tool, parameters, error: e.message });
+      });
   }
 
-  // -- Events from bodies --
+  // -- Events from bodies (direct in-process, no HTTP) --
 
   onBodyEvent(bodyName, eventType, payload, priority = "NORMAL") {
     this.emit("body_event", { body: bodyName, type: eventType, payload, priority });
-    this._addToHistory(`${bodyName}: event ${eventType}`);
+    this._addToHistory(`${bodyName}: ${eventType}`);
   }
 
   _addToHistory(entry) {
@@ -200,7 +228,15 @@ class Space extends EventEmitter {
     }
   }
 
-  // -- Stats --
+  // -- Introspection --
+
+  getTools() {
+    const out = [];
+    for (const [fqn, entry] of this.toolRegistry) {
+      out.push({ fqn, body: entry.body.name, tool: entry.tool, def: entry.def });
+    }
+    return out;
+  }
 
   getStats() {
     return {
@@ -208,11 +244,12 @@ class Space extends EventEmitter {
       running: this._running,
       tick: this._tick,
       bodies: this.bodies.size,
+      tools: this.toolRegistry.size,
       brainInFlight: this._brainInFlight,
       queuedResponses: this._brainResponseQueue.length,
       translator: this.translator.getStats(),
       aggregator: this.aggregator.getStats(),
-      brain: this.brain ? (typeof this.brain.stats === "function" ? this.brain.stats() : null) : null,
+      brain: this.brain && typeof this.brain.stats === "function" ? this.brain.stats() : null,
     };
   }
 }

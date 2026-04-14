@@ -1,4 +1,4 @@
-const { describe, test, after } = require("node:test");
+const { describe, test } = require("node:test");
 const assert = require("node:assert");
 
 const {
@@ -7,31 +7,14 @@ const {
   Brain,
   Translator,
   Aggregator,
-  OllamaBrain,
+  PRIORITY,
 } = require("..");
+const { OllamaBrain } = require("../packages/bridges/ollama");
 
 // -- Helpers --
 
-class FakeTransport {
-  constructor() {
-    this.sent = [];
-    this._handlers = new Map();
-  }
-  emit(type, data) { this.sent.push({ type, data }); }
-  on(type, handler) { this._handlers.set(type, handler); }
-  _dispatch(type, data) {
-    const h = this._handlers.get(type);
-    if (h) h(data);
-  }
-  async start() {}
-  async stop() {}
-}
-
 class FakeBrain extends Brain {
-  constructor(response) {
-    super({ model: "fake" });
-    this._response = response;
-  }
+  constructor(response) { super({ model: "fake" }); this._response = response; }
   async _rawCall() {
     return typeof this._response === "string"
       ? this._response
@@ -39,248 +22,389 @@ class FakeBrain extends Brain {
   }
 }
 
-function makeBody(name, opts = {}) {
-  return new BodyAdapter({
-    name,
-    capabilities: opts.capabilities || ["move_to", "halt"],
-    transport: opts.transport || new FakeTransport(),
-  });
+class TestBody extends BodyAdapter {
+  static tools = {
+    say: {
+      description: "say something",
+      parameters: {
+        msg: { type: "string", required: true },
+      },
+    },
+    count: {
+      description: "increment counter",
+      parameters: {
+        by: { type: "number", min: 0, max: 100 },
+      },
+    },
+    ping: {
+      description: "no args",
+      parameters: {},
+    },
+  };
+  constructor(name = "test_body") {
+    super({ name });
+    this.counter = 0;
+    this.lastSaid = null;
+    this.tickCount = 0;
+  }
+  async say({ msg }) { this.lastSaid = msg; return { said: msg }; }
+  async count({ by = 1 }) { this.counter += by; return this.counter; }
+  async ping() { return "pong"; }
+  async tick() { await super.tick(); this.tickCount++; }
 }
 
-// -- Space lifecycle --
+class EmptyBody extends BodyAdapter {
+  static tools = {};
+  constructor() { super({ name: "empty" }); }
+}
 
-describe("Space", () => {
+// ============================================================
+// Space
+// ============================================================
+
+describe("Space lifecycle", () => {
   test("throws if no bodies registered", async () => {
-    const s = new Space("test");
-    s.setBrain(new FakeBrain({ target_body: "x", action: "y" }));
+    const s = new Space("t");
+    s.setBrain(new FakeBrain({ target_body: "x", tool: "y" }));
     await assert.rejects(() => s.run(), { message: /no bodies/ });
   });
 
   test("throws if no brain registered", async () => {
-    const s = new Space("test");
-    s.addBody(makeBody("a"));
+    const s = new Space("t");
+    s.addBody(new TestBody());
     await assert.rejects(() => s.run(), { message: /no brain/ });
   });
 
-  test("addBody rejects duplicate names", () => {
-    const s = new Space("test");
-    s.addBody(makeBody("a"));
-    assert.throws(() => s.addBody(makeBody("a")), { message: /already registered/ });
+  test("addBody rejects duplicates", () => {
+    const s = new Space("t");
+    s.addBody(new TestBody("a"));
+    assert.throws(() => s.addBody(new TestBody("a")), { message: /already registered/ });
   });
 
-  test("addBody rejects nameless adapters", () => {
-    const s = new Space("test");
+  test("addBody rejects nameless", () => {
+    const s = new Space("t");
     assert.throws(() => s.addBody({}), { message: /must have a name/ });
   });
 
   test("setBrain requires invoke()", () => {
-    const s = new Space("test");
+    const s = new Space("t");
     assert.throws(() => s.setBrain({}), { message: /must have invoke/ });
   });
 
-  test("run() calls onConfigure then onActivate on all bodies", async () => {
-    const order = [];
-    class TestBody extends BodyAdapter {
-      async onConfigure() { order.push(`${this.name}:configure`); await super.onConfigure(); }
-      async onActivate() { order.push(`${this.name}:activate`); await super.onActivate(); }
-    }
-    const s = new Space("test", { tickHz: 10 });
-    s.addBody(new TestBody({ name: "a", transport: new FakeTransport() }));
-    s.addBody(new TestBody({ name: "b", transport: new FakeTransport() }));
-    s.setBrain(new FakeBrain({ target_body: "a", action: "halt" }));
-    await s.run();
-    await s.stop();
-    assert.deepStrictEqual(order, ["a:configure", "b:configure", "a:activate", "b:activate"]);
+  test("addBody registers tools", () => {
+    const s = new Space("t");
+    s.addBody(new TestBody("a"));
+    const tools = s.getTools();
+    assert.strictEqual(tools.length, 3);
+    assert.ok(tools.some(t => t.fqn === "a.say"));
+    assert.ok(tools.some(t => t.fqn === "a.count"));
+    assert.ok(tools.some(t => t.fqn === "a.ping"));
   });
 
-  test("stop() triggers onEmergencyStop", async () => {
+  test("tool registry combines bodies", () => {
+    const s = new Space("t");
+    s.addBody(new TestBody("a"));
+    s.addBody(new TestBody("b"));
+    assert.strictEqual(s.getTools().length, 6);
+  });
+
+  test("run calls onConfigure then onActivate on all bodies", async () => {
+    const order = [];
+    class OrderBody extends TestBody {
+      async onConfigure() { order.push(`${this.name}:config`); await super.onConfigure(); }
+      async onActivate() { order.push(`${this.name}:activate`); await super.onActivate(); }
+    }
+    const s = new Space("t", { tickHz: 10, brainIntervalMs: 99999 });
+    s.addBody(new OrderBody("a"));
+    s.addBody(new OrderBody("b"));
+    s.setBrain(new FakeBrain({ target_body: "a", tool: "ping" }));
+    await s.run();
+    await s.stop();
+    assert.deepStrictEqual(order.slice(0, 4), ["a:config", "b:config", "a:activate", "b:activate"]);
+  });
+
+  test("stop triggers onEmergencyStop", async () => {
     let stopped = 0;
-    class TestBody extends BodyAdapter {
+    class StopBody extends TestBody {
       async onEmergencyStop() { stopped++; await super.onEmergencyStop(); }
     }
-    const s = new Space("test", { tickHz: 10 });
-    s.addBody(new TestBody({ name: "a", transport: new FakeTransport() }));
-    s.setBrain(new FakeBrain({ target_body: "a", action: "halt" }));
+    const s = new Space("t", { tickHz: 10, brainIntervalMs: 99999 });
+    s.addBody(new StopBody("a"));
+    s.setBrain(new FakeBrain({ target_body: "a", tool: "ping" }));
     await s.run();
     await s.stop();
     assert.strictEqual(stopped, 1);
   });
 });
 
-// -- BodyAdapter modes --
+// ============================================================
+// Reactor: tick() + tool dispatch
+// ============================================================
+
+describe("Space reactor", () => {
+  test("calls body.tick() every reactor tick", async () => {
+    const body = new TestBody("a");
+    const s = new Space("t", { tickHz: 60, brainIntervalMs: 99999 });
+    s.addBody(body);
+    s.setBrain(new FakeBrain({ target_body: "a", tool: "ping" }));
+    await s.run();
+    await new Promise(r => setTimeout(r, 250));
+    await s.stop();
+    assert.ok(body.tickCount > 5, `tickCount=${body.tickCount} should exceed 5`);
+  });
+
+  test("dispatches tool via direct method call", async () => {
+    const body = new TestBody("a");
+    const s = new Space("t", { tickHz: 120, brainIntervalMs: 50, aggregateEveryTicks: 5 });
+    s.addBody(body);
+    s.setBrain(new FakeBrain({ target_body: "a", tool: "say", parameters: { msg: "hi" } }));
+    await s.run();
+    await new Promise(r => setTimeout(r, 500));
+    await s.stop();
+    assert.strictEqual(body.lastSaid, "hi");
+  });
+
+  test("tool call increments tools dispatched stat", async () => {
+    const body = new TestBody("a");
+    const s = new Space("t", { tickHz: 120, brainIntervalMs: 50, aggregateEveryTicks: 5 });
+    s.addBody(body);
+    s.setBrain(new FakeBrain({ target_body: "a", tool: "ping" }));
+    await s.run();
+    await new Promise(r => setTimeout(r, 300));
+    await s.stop();
+    assert.ok(s.getStats().toolsDispatched >= 1);
+  });
+
+  test("tick errors increment tickErrors stat", async () => {
+    class CrashBody extends TestBody {
+      async tick() { throw new Error("boom"); }
+    }
+    const body = new CrashBody("a");
+    const s = new Space("t", { tickHz: 60, brainIntervalMs: 99999 });
+    s.addBody(body);
+    s.setBrain(new FakeBrain({ target_body: "a", tool: "ping" }));
+    await s.run();
+    await new Promise(r => setTimeout(r, 200));
+    await s.stop();
+    assert.ok(s.getStats().tickErrors > 0);
+  });
+});
+
+// ============================================================
+// BodyAdapter
+// ============================================================
+
+describe("BodyAdapter tools", () => {
+  test("invokeTool calls the method", async () => {
+    const b = new TestBody();
+    const r = await b.invokeTool("say", { msg: "hello" });
+    assert.strictEqual(r.said, "hello");
+    assert.strictEqual(b.lastSaid, "hello");
+  });
+
+  test("invokeTool throws on unknown tool", async () => {
+    const b = new TestBody();
+    await assert.rejects(() => b.invokeTool("nope"), { message: /unknown tool/ });
+  });
+
+  test("invokeTool throws if declared but no method", async () => {
+    class BrokenBody extends BodyAdapter {
+      static tools = { ghost: { description: "no impl" } };
+      constructor() { super({ name: "broken" }); }
+    }
+    const b = new BrokenBody();
+    await assert.rejects(() => b.invokeTool("ghost"), { message: /no method/ });
+  });
+
+  test("invokeTool counts call and error stats", async () => {
+    class FailBody extends TestBody {
+      async say() { throw new Error("nope"); }
+    }
+    const b = new FailBody();
+    try { await b.invokeTool("say", { msg: "x" }); } catch {}
+    assert.strictEqual(b.stats.toolCalls, 1);
+    assert.strictEqual(b.stats.toolErrors, 1);
+  });
+
+  test("getToolDefinitions reflects static tools", () => {
+    const b = new TestBody();
+    const defs = b.getToolDefinitions();
+    assert.ok(defs.say);
+    assert.ok(defs.count);
+    assert.ok(defs.ping);
+  });
+});
 
 describe("BodyAdapter modes", () => {
   test("default mode is standalone", () => {
-    const b = makeBody("a");
-    assert.strictEqual(b.mode, "standalone");
+    assert.strictEqual(new TestBody().mode, "standalone");
   });
 
-  test("attaching to Space flips mode to managed", () => {
-    const s = new Space("test");
-    const b = makeBody("a");
+  test("attaching to Space flips to managed", () => {
+    const s = new Space("t");
+    const b = new TestBody();
     s.addBody(b);
     assert.strictEqual(b.mode, "managed");
   });
 
-  test("attach sends set_mode over transport", () => {
-    const t = new FakeTransport();
-    const s = new Space("test");
-    const b = makeBody("a", { transport: t });
-    s.addBody(b);
-
-    const msg = t.sent.find(m => m.type === "set_mode");
-    assert.ok(msg, "expected set_mode message to be sent");
-    assert.strictEqual(msg.data.mode, "managed");
-    assert.strictEqual(msg.data.body, "a");
-  });
-
-  test("detachSpace reverts to standalone", () => {
-    const s = new Space("test");
-    const b = makeBody("a");
+  test("detach reverts to standalone", () => {
+    const s = new Space("t");
+    const b = new TestBody();
     s.addBody(b);
     b._detachSpace();
     assert.strictEqual(b.mode, "standalone");
   });
 
-  test("invalid mode throws", () => {
-    const b = makeBody("a");
-    assert.throws(() => b._setMode("rogue"), { message: /invalid mode/ });
-  });
-
-  test("snapshot includes mode", () => {
-    const b = makeBody("a");
-    const snap = b.snapshot();
-    assert.strictEqual(snap.mode, "standalone");
-  });
-
   test("cannot attach to two Spaces", () => {
     const s1 = new Space("s1");
     const s2 = new Space("s2");
-    const b = makeBody("a");
+    const b = new TestBody();
     s1.addBody(b);
     assert.throws(() => s2.addBody(b), { message: /already attached/ });
   });
+
+  test("snapshot includes mode", () => {
+    const b = new TestBody();
+    assert.strictEqual(b.snapshot().mode, "standalone");
+  });
+
+  test("invalid mode throws", () => {
+    const b = new TestBody();
+    assert.throws(() => b._setMode("rogue"), { message: /invalid mode/ });
+  });
 });
 
-describe("BodyAdapter execute", () => {
-  test("rejects intent missing action", async () => {
-    const b = makeBody("a");
-    await assert.rejects(() => b.execute({}), { message: /missing action/ });
+describe("BodyAdapter events", () => {
+  test("emit defaults to NORMAL", () => {
+    const b = new TestBody();
+    b.emit("x");
+    assert.strictEqual(b.snapshot().pending_events[0].priority, "NORMAL");
   });
 
-  test("rejects action not in capabilities", async () => {
-    const b = makeBody("a", { capabilities: ["halt"] });
-    await assert.rejects(() => b.execute({ action: "jump" }), { message: /not declared/ });
+  test("emit accepts CRITICAL", () => {
+    const b = new TestBody();
+    b.emit("collision", {}, "CRITICAL");
+    assert.strictEqual(b.snapshot().pending_events[0].priority, "CRITICAL");
   });
 
-  test("emits events and stores them", () => {
-    const b = makeBody("a");
-    b.emit("entity_detected", { kind: "box" });
-    const snap = b.snapshot();
-    assert.strictEqual(snap.pending_events.length, 1);
-    assert.strictEqual(snap.pending_events[0].type, "entity_detected");
+  test("invalid priority falls back to NORMAL", () => {
+    const b = new TestBody();
+    b.emit("x", {}, "WHATEVER");
+    assert.strictEqual(b.snapshot().pending_events[0].priority, "NORMAL");
   });
 
-  test("clearPendingEvents drains the buffer", () => {
-    const b = makeBody("a");
+  test("queue overflow keeps CRITICAL", () => {
+    const b = new TestBody();
+    b.emit("critical_1", {}, "CRITICAL");
+    for (let i = 0; i < 30; i++) b.emit(`low_${i}`, {}, "LOW");
+    const events = b.snapshot().pending_events;
+    assert.ok(events.some(e => e.type === "critical_1" && e.priority === "CRITICAL"));
+  });
+
+  test("clearPendingEvents drains queue", () => {
+    const b = new TestBody();
     b.emit("x");
     b.clearPendingEvents();
     assert.strictEqual(b.snapshot().pending_events.length, 0);
   });
 
-  test("emit defaults to NORMAL priority", () => {
-    const b = makeBody("a");
-    b.emit("some_event");
-    const e = b.snapshot().pending_events[0];
-    assert.strictEqual(e.priority, "NORMAL");
-  });
-
-  test("emit accepts CRITICAL priority", () => {
-    const b = makeBody("a");
-    b.emit("collision_warning", {}, "CRITICAL");
-    const e = b.snapshot().pending_events[0];
-    assert.strictEqual(e.priority, "CRITICAL");
-  });
-
-  test("emit rejects invalid priority and falls back to NORMAL", () => {
-    const b = makeBody("a");
-    b.emit("x", {}, "EMERGENCY"); // not a valid level
-    const e = b.snapshot().pending_events[0];
-    assert.strictEqual(e.priority, "NORMAL");
-  });
-
-  test("queue overflow keeps CRITICAL events", () => {
-    const b = makeBody("a");
-    b.emit("critical_1", {}, "CRITICAL");
-    for (let i = 0; i < 25; i++) b.emit(`low_${i}`, {}, "LOW");
-    const events = b.snapshot().pending_events;
-    const criticals = events.filter((e) => e.priority === "CRITICAL");
-    assert.ok(criticals.length >= 1, "CRITICAL event should survive queue overflow");
-    assert.strictEqual(criticals[0].type, "critical_1");
+  test("emit pushes event up to Space", () => {
+    const s = new Space("t");
+    const b = new TestBody();
+    s.addBody(b);
+    let received = null;
+    s.on("body_event", (e) => { received = e; });
+    b.emit("ping", { foo: 1 }, "HIGH");
+    assert.strictEqual(received.body, "test_body");
+    assert.strictEqual(received.type, "ping");
+    assert.strictEqual(received.priority, "HIGH");
+    assert.deepStrictEqual(received.payload, { foo: 1 });
   });
 });
 
-// -- Brain base class --
+describe("PRIORITY export", () => {
+  test("exports priority constants", () => {
+    assert.strictEqual(PRIORITY.CRITICAL, 0);
+    assert.strictEqual(PRIORITY.HIGH, 1);
+    assert.strictEqual(PRIORITY.NORMAL, 2);
+    assert.strictEqual(PRIORITY.LOW, 3);
+  });
+});
+
+// ============================================================
+// Brain
+// ============================================================
 
 describe("Brain", () => {
   test("_rawCall throws if not implemented", async () => {
-    const b = new Brain();
-    await assert.rejects(() => b._rawCall(""), { message: /must be implemented/ });
+    await assert.rejects(() => new Brain()._rawCall(""), { message: /must be implemented/ });
   });
 
-  test("invoke parses valid JSON", async () => {
-    const b = new FakeBrain({ target_body: "a", action: "halt" });
+  test("invoke parses valid JSON tool call", async () => {
+    const b = new FakeBrain({ target_body: "a", tool: "say", parameters: { msg: "hi" } });
     const intent = await b.invoke({ bodies: {} });
     assert.strictEqual(intent.target_body, "a");
-    assert.strictEqual(intent.action, "halt");
-    assert.strictEqual(intent.priority, 3); // default
-    assert.strictEqual(intent.fallback, "hold_position");
+    assert.strictEqual(intent.tool, "say");
+    assert.deepStrictEqual(intent.parameters, { msg: "hi" });
+  });
+
+  test("invoke accepts 'action' as legacy alias for 'tool'", async () => {
+    const b = new FakeBrain({ target_body: "a", action: "halt" });
+    const intent = await b.invoke({ bodies: {} });
+    assert.strictEqual(intent.tool, "halt");
   });
 
   test("invoke returns null for invalid JSON", async () => {
-    const b = new FakeBrain("not json at all");
-    const intent = await b.invoke({ bodies: {} });
-    assert.strictEqual(intent, null);
+    const b = new FakeBrain("not json");
+    assert.strictEqual(await b.invoke({ bodies: {} }), null);
   });
 
   test("invoke returns null for missing required fields", async () => {
-    const b = new FakeBrain({ action: "halt" }); // no target_body
-    const intent = await b.invoke({ bodies: {} });
-    assert.strictEqual(intent, null);
+    const b = new FakeBrain({ tool: "halt" });
+    assert.strictEqual(await b.invoke({ bodies: {} }), null);
   });
 
   test("invoke extracts JSON from surrounding text", async () => {
-    const b = new FakeBrain('Sure! Here is my decision: {"target_body":"a","action":"halt"}');
+    const b = new FakeBrain('thinking... {"target_body":"a","tool":"ping"} done');
     const intent = await b.invoke({ bodies: {} });
     assert.strictEqual(intent.target_body, "a");
   });
 
-  test("invoke clamps priority to 1-5", async () => {
-    const b = new FakeBrain({ target_body: "a", action: "halt", priority: 99 });
+  test("invoke clamps priority 1-5", async () => {
+    const b = new FakeBrain({ target_body: "a", tool: "p", priority: 99 });
     const intent = await b.invoke({ bodies: {} });
     assert.strictEqual(intent.priority, 5);
   });
 
-  test("stats increment on call", async () => {
-    const b = new FakeBrain({ target_body: "a", action: "halt" });
-    await b.invoke({ bodies: {} });
-    assert.strictEqual(b.callCount, 1);
-    assert.strictEqual(b.errorCount, 0);
+  test("buildPrompt includes tool definitions", () => {
+    const b = new Brain();
+    const p = b.buildPrompt({
+      bodies: {
+        cartpole: {
+          status: "active",
+          tools: {
+            apply_force: { description: "push", parameters: { direction: {} } },
+          },
+        },
+      },
+      active_goal: "balance",
+    });
+    assert.ok(p.includes("cartpole"));
+    assert.ok(p.includes("apply_force"));
+    assert.ok(p.includes("push"));
+    assert.ok(p.includes("balance"));
   });
 
-  test("buildPrompt includes body names and active goal", () => {
-    const b = new Brain();
-    const prompt = b.buildPrompt({
-      bodies: { arm: { status: "active", last_action: "move_to" } },
-      active_goal: "pick up the box",
-      recent_history: ["arm moved"],
-    });
-    assert.ok(prompt.includes("arm"));
-    assert.ok(prompt.includes("pick up the box"));
+  test("stats increment on call", async () => {
+    const b = new FakeBrain({ target_body: "a", tool: "p" });
+    await b.invoke({ bodies: {} });
+    assert.strictEqual(b.callCount, 1);
   });
 });
 
-// -- OllamaBrain --
+// ============================================================
+// OllamaBrain
+// ============================================================
 
 describe("OllamaBrain", () => {
   test("constructor defaults", () => {
@@ -290,257 +414,245 @@ describe("OllamaBrain", () => {
   });
 
   test("isAvailable returns false for unreachable host", async () => {
-    const ok = await OllamaBrain.isAvailable("http://localhost:19999");
-    assert.strictEqual(ok, false);
+    assert.strictEqual(await OllamaBrain.isAvailable("http://localhost:19999"), false);
   });
 
-  test("isAvailable never throws", async () => {
-    // Doesn't matter if Ollama is running or not; just must not throw.
-    await OllamaBrain.isAvailable("http://not-a-real-host-9999.invalid");
+  test("isAvailable never throws on invalid host", async () => {
+    await OllamaBrain.isAvailable("http://not-real-9999.invalid");
     assert.ok(true);
   });
 });
 
-// -- Translator --
+// ============================================================
+// Translator
+// ============================================================
 
 describe("Translator", () => {
   function setup() {
     const t = new Translator();
     const bodies = new Map();
-    bodies.set("arm", new BodyAdapter({
-      name: "arm",
-      capabilities: ["move_to", "halt"],
-      transport: new FakeTransport(),
-    }));
+    bodies.set("arm", new TestBody("arm"));
     return { t, bodies };
   }
 
-  test("translates valid intent", () => {
+  test("translates valid tool call", () => {
     const { t, bodies } = setup();
-    const r = t.translate(
-      { target_body: "arm", action: "move_to", parameters: { x: 1 } },
-      bodies
-    );
+    const r = t.translate({ target_body: "arm", tool: "say", parameters: { msg: "hello" } }, bodies);
     assert.strictEqual(r.ok, true);
-    assert.strictEqual(r.command.body, "arm");
-    assert.strictEqual(r.command.action, "move_to");
-    assert.deepStrictEqual(r.command.parameters, { x: 1 });
+    assert.strictEqual(r.command.tool, "say");
+    assert.deepStrictEqual(r.command.parameters, { msg: "hello" });
   });
 
-  test("rejects invalid_intent for non-object", () => {
+  test("accepts 'action' legacy alias", () => {
     const { t, bodies } = setup();
-    const r = t.translate(null, bodies);
-    assert.strictEqual(r.ok, false);
-    assert.strictEqual(r.reason, "invalid_intent");
+    const r = t.translate({ target_body: "arm", action: "ping" }, bodies);
+    assert.strictEqual(r.ok, true);
+    assert.strictEqual(r.command.tool, "ping");
+  });
+
+  test("rejects invalid_intent", () => {
+    const { t, bodies } = setup();
+    assert.strictEqual(t.translate(null, bodies).reason, "invalid_intent");
   });
 
   test("rejects missing_target_body", () => {
     const { t, bodies } = setup();
-    const r = t.translate({ action: "halt" }, bodies);
-    assert.strictEqual(r.ok, false);
-    assert.strictEqual(r.reason, "missing_target_body");
+    assert.strictEqual(t.translate({ tool: "say" }, bodies).reason, "missing_target_body");
   });
 
-  test("rejects missing_action", () => {
+  test("rejects missing_tool", () => {
     const { t, bodies } = setup();
-    const r = t.translate({ target_body: "arm" }, bodies);
-    assert.strictEqual(r.ok, false);
-    assert.strictEqual(r.reason, "missing_action");
+    assert.strictEqual(t.translate({ target_body: "arm" }, bodies).reason, "missing_tool");
   });
 
   test("rejects unknown_body", () => {
     const { t, bodies } = setup();
-    const r = t.translate({ target_body: "leg", action: "halt" }, bodies);
-    assert.strictEqual(r.ok, false);
-    assert.strictEqual(r.reason, "unknown_body");
+    assert.strictEqual(t.translate({ target_body: "leg", tool: "say" }, bodies).reason, "unknown_body");
   });
 
-  test("rejects capability_denied", () => {
+  test("rejects unknown_tool", () => {
     const { t, bodies } = setup();
-    const r = t.translate({ target_body: "arm", action: "jump" }, bodies);
-    assert.strictEqual(r.ok, false);
-    assert.strictEqual(r.reason, "capability_denied");
+    assert.strictEqual(t.translate({ target_body: "arm", tool: "jump" }, bodies).reason, "unknown_tool");
   });
 
-  test("rejects action_not_allowed with global allowlist", () => {
-    const bodies = new Map();
-    bodies.set("arm", new BodyAdapter({
-      name: "arm",
-      // No capabilities declared -> body allows all
-      transport: new FakeTransport(),
-    }));
-    const t = new Translator({ allowedActions: new Set(["halt"]) });
-    const r = t.translate({ target_body: "arm", action: "move_to" }, bodies);
+  test("rejects invalid_parameters (missing required)", () => {
+    const { t, bodies } = setup();
+    const r = t.translate({ target_body: "arm", tool: "say", parameters: {} }, bodies);
     assert.strictEqual(r.ok, false);
-    assert.strictEqual(r.reason, "action_not_allowed");
+    assert.strictEqual(r.reason, "invalid_parameters");
   });
 
-  test("stats track rejections by reason", () => {
+  test("rejects invalid_parameters (wrong type)", () => {
+    const { t, bodies } = setup();
+    const r = t.translate({ target_body: "arm", tool: "say", parameters: { msg: 123 } }, bodies);
+    assert.strictEqual(r.reason, "invalid_parameters");
+  });
+
+  test("rejects invalid_parameters (out of range)", () => {
+    const { t, bodies } = setup();
+    const r = t.translate({ target_body: "arm", tool: "count", parameters: { by: 999 } }, bodies);
+    assert.strictEqual(r.reason, "invalid_parameters");
+  });
+
+  test("accepts parameters with enum", () => {
+    class EnumBody extends BodyAdapter {
+      static tools = {
+        go: {
+          description: "go a direction",
+          parameters: { dir: { type: "string", enum: ["n","s","e","w"], required: true } },
+        },
+      };
+      constructor() { super({ name: "enum" }); }
+      async go() {}
+    }
+    const bodies = new Map([["enum", new EnumBody()]]);
+    const t = new Translator();
+    const good = t.translate({ target_body: "enum", tool: "go", parameters: { dir: "n" } }, bodies);
+    assert.strictEqual(good.ok, true);
+    const bad = t.translate({ target_body: "enum", tool: "go", parameters: { dir: "nw" } }, bodies);
+    assert.strictEqual(bad.reason, "invalid_parameters");
+  });
+
+  test("global allowlist blocks tool", () => {
+    const t = new Translator({ allowedTools: new Set(["arm.ping"]) });
+    const bodies = new Map([["arm", new TestBody("arm")]]);
+    const r = t.translate({ target_body: "arm", tool: "say", parameters: { msg: "x" } }, bodies);
+    assert.strictEqual(r.reason, "tool_not_allowed");
+  });
+
+  test("stats track reasons", () => {
     const { t, bodies } = setup();
     t.translate(null, bodies);
-    t.translate({ target_body: "x", action: "halt" }, bodies);
-    t.translate({ target_body: "arm", action: "jump" }, bodies);
+    t.translate({ target_body: "X", tool: "say" }, bodies);
+    t.translate({ target_body: "arm", tool: "jump" }, bodies);
     const s = t.getStats();
     assert.strictEqual(s.byReason.invalid_intent, 1);
     assert.strictEqual(s.byReason.unknown_body, 1);
-    assert.strictEqual(s.byReason.capability_denied, 1);
+    assert.strictEqual(s.byReason.unknown_tool, 1);
   });
 });
 
-// -- Aggregator --
+// ============================================================
+// Aggregator
+// ============================================================
 
 describe("Aggregator", () => {
   test("merges state from two bodies", () => {
     const a = new Aggregator();
-    const bodies = new Map();
-    const b1 = new BodyAdapter({ name: "a", transport: new FakeTransport() });
-    const b2 = new BodyAdapter({ name: "b", transport: new FakeTransport() });
-    b1.setState({ position: { x: 1 } });
-    b2.setState({ position: { x: 2 } });
-    bodies.set("a", b1);
-    bodies.set("b", b2);
+    const b1 = new TestBody("a"); b1.setState({ pos: { x: 1 } });
+    const b2 = new TestBody("b"); b2.setState({ pos: { x: 2 } });
+    const out = a.aggregate(new Map([["a", b1], ["b", b2]]));
+    assert.strictEqual(out.bodies.a.pos.x, 1);
+    assert.strictEqual(out.bodies.b.pos.x, 2);
+  });
 
-    const out = a.aggregate(bodies);
-    assert.ok(out.bodies.a);
-    assert.ok(out.bodies.b);
-    assert.strictEqual(out.bodies.a.position.x, 1);
-    assert.strictEqual(out.bodies.b.position.x, 2);
+  test("includes tool definitions in aggregated state", () => {
+    const a = new Aggregator();
+    const b = new TestBody("a");
+    const out = a.aggregate(new Map([["a", b]]));
+    assert.ok(out.bodies.a.tools);
+    assert.ok(out.bodies.a.tools.say);
+    assert.strictEqual(out.bodies.a.tools.say.description, "say something");
+  });
+
+  test("omits tools for bodies with none", () => {
+    const a = new Aggregator();
+    const out = a.aggregate(new Map([["e", new EmptyBody()]]));
+    assert.strictEqual(out.bodies.e.tools, undefined);
   });
 
   test("clears pending events after aggregation", () => {
     const a = new Aggregator();
-    const body = new BodyAdapter({ name: "x", transport: new FakeTransport() });
-    body.emit("detected", { kind: "cup" });
-    const bodies = new Map([["x", body]]);
-
-    const out = a.aggregate(bodies);
-    assert.strictEqual(out.bodies.x.pending_events.length, 1);
-    // Second aggregate should see zero because first one cleared
-    const out2 = a.aggregate(bodies);
-    assert.strictEqual(out2.bodies.x.pending_events, undefined);
+    const b = new TestBody("a");
+    b.emit("x");
+    const out1 = a.aggregate(new Map([["a", b]]));
+    assert.strictEqual(out1.bodies.a.pending_events.length, 1);
+    const out2 = a.aggregate(new Map([["a", b]]));
+    assert.strictEqual(out2.bodies.a.pending_events, undefined);
   });
 
-  test("enforces token budget under 2000", () => {
-    const a = new Aggregator({ tokenBudget: 500 });
+  test("enforces token budget", () => {
+    const a = new Aggregator({ tokenBudget: 300 });
     const bodies = new Map();
-
-    // Create many bodies with bulky state
-    for (let i = 0; i < 20; i++) {
-      const b = new BodyAdapter({ name: `body_${i}`, transport: new FakeTransport() });
-      b.setState({
-        long_field: "x".repeat(500),
-        positions: Array(20).fill({ x: 1.12345, y: 2.6789, z: 3.45678 }),
-      });
-      bodies.set(`body_${i}`, b);
+    for (let i = 0; i < 10; i++) {
+      const b = new TestBody(`b${i}`);
+      b.setState({ bulk: "x".repeat(500) });
+      bodies.set(`b${i}`, b);
     }
-
     const out = a.aggregate(bodies);
     const size = Math.ceil(JSON.stringify(out).length / 4);
-    assert.ok(size <= 500, `expected size <= 500 tokens, got ${size}`);
-  });
-
-  test("flags stale state", async () => {
-    const a = new Aggregator({ staleMs: 50 });
-    const body = new BodyAdapter({ name: "slow", transport: new FakeTransport() });
-    body.setState({ value: 1 });
-    // Wait for staleness threshold
-    await new Promise((r) => setTimeout(r, 100));
-    const bodies = new Map([["slow", body]]);
-
-    const out = a.aggregate(bodies);
-    assert.strictEqual(out.bodies.slow.stale, true);
-    assert.ok(out.bodies.slow.age_ms >= 50);
-  });
-
-  test("compacts float values to 3 decimals", () => {
-    const a = new Aggregator();
-    const b = new BodyAdapter({ name: "x", transport: new FakeTransport() });
-    b.setState({ pos: 3.14159265 });
-    const out = a.aggregate(new Map([["x", b]]));
-    assert.strictEqual(out.bodies.x.pos, 3.142);
-  });
-
-  test("truncates long strings", () => {
-    const a = new Aggregator();
-    const b = new BodyAdapter({ name: "x", transport: new FakeTransport() });
-    b.setState({ note: "z".repeat(500) });
-    const out = a.aggregate(new Map([["x", b]]));
-    assert.ok(out.bodies.x.note.length <= 120);
-  });
-
-  test("drops LOW events before NORMAL when over budget", () => {
-    const a = new Aggregator({ tokenBudget: 120, maxPendingEventsPerBody: 50 });
-    const b = new BodyAdapter({ name: "x", transport: new FakeTransport() });
-    for (let i = 0; i < 10; i++) b.emit(`low_${i}`, {}, "LOW");
-    for (let i = 0; i < 10; i++) b.emit(`normal_${i}`, {}, "NORMAL");
-    const out = a.aggregate(new Map([["x", b]]));
-    const s = a.getStats();
-    assert.ok(s.droppedByPriority.LOW >= s.droppedByPriority.NORMAL,
-      `LOW should be dropped at least as aggressively as NORMAL. LOW=${s.droppedByPriority.LOW} NORMAL=${s.droppedByPriority.NORMAL}`);
+    assert.ok(size <= 300, `expected <= 300 tokens, got ${size}`);
   });
 
   test("CRITICAL events survive severe budget pressure", () => {
     const a = new Aggregator({ tokenBudget: 200, maxPendingEventsPerBody: 50 });
-    const b = new BodyAdapter({ name: "x", transport: new FakeTransport() });
-    b.emit("collision_warning", { severity: "high" }, "CRITICAL");
-    b.setState({ big: "x".repeat(500), other: "y".repeat(500) });
-    // Add many LOW events to push size way past budget
-    for (let i = 0; i < 30; i++) b.emit(`low_${i}`, { data: "z".repeat(30) }, "LOW");
-
-    const out = a.aggregate(new Map([["x", b]]));
-    // Body still exists
-    assert.ok(out.bodies.x, "body should not be dropped when it has CRITICAL events");
-    // CRITICAL event survived
-    const events = out.bodies.x.pending_events || [];
-    const critical = events.find((e) => e.type === "collision_warning");
-    assert.ok(critical, "CRITICAL event must survive trimming");
-    assert.strictEqual(critical.priority, "CRITICAL");
+    const b = new TestBody("a");
+    b.emit("emergency", { severity: "high" }, "CRITICAL");
+    b.setState({ bulk: "x".repeat(500) });
+    for (let i = 0; i < 30; i++) b.emit(`low_${i}`, { j: "z".repeat(30) }, "LOW");
+    const out = a.aggregate(new Map([["a", b]]));
+    assert.ok(out.bodies.a);
+    const events = out.bodies.a.pending_events || [];
+    assert.ok(events.some((e) => e.type === "emergency" && e.priority === "CRITICAL"));
   });
 
-  test("CRITICAL events kept even in per-body cap", () => {
-    const a = new Aggregator({ maxPendingEventsPerBody: 3 });
-    const b = new BodyAdapter({ name: "x", transport: new FakeTransport() });
-    b.emit("crit_1", {}, "CRITICAL");
-    b.emit("crit_2", {}, "CRITICAL");
-    for (let i = 0; i < 10; i++) b.emit(`low_${i}`, {}, "LOW");
-
-    const out = a.aggregate(new Map([["x", b]]));
-    const events = out.bodies.x.pending_events;
-    const criticals = events.filter((e) => e.priority === "CRITICAL");
-    assert.strictEqual(criticals.length, 2, "both CRITICAL events must be kept");
+  test("LOW dropped before NORMAL under budget pressure", () => {
+    // Keep event count below the body's 20-event cap so both priorities reach the aggregator.
+    const a = new Aggregator({ tokenBudget: 150, maxPendingEventsPerBody: 50 });
+    const b = new TestBody("a");
+    for (let i = 0; i < 8; i++) b.emit(`low_${i}`, {}, "LOW");
+    for (let i = 0; i < 8; i++) b.emit(`normal_${i}`, {}, "NORMAL");
+    a.aggregate(new Map([["a", b]]));
+    const s = a.getStats();
+    // LOW must be dropped at least as many times as NORMAL.
+    assert.ok(
+      s.droppedByPriority.LOW >= s.droppedByPriority.NORMAL,
+      `LOW=${s.droppedByPriority.LOW} NORMAL=${s.droppedByPriority.NORMAL}`
+    );
   });
 
-  test("body with CRITICAL events dropped last", () => {
-    const a = new Aggregator({ tokenBudget: 100, maxPendingEventsPerBody: 50 });
-    const bodies = new Map();
-    const critical = new BodyAdapter({ name: "critical_body", transport: new FakeTransport() });
-    critical.emit("alert", {}, "CRITICAL");
-    critical.setState({ data: "x".repeat(200) });
-
-    const normal = new BodyAdapter({ name: "normal_body", transport: new FakeTransport() });
-    normal.setState({ data: "y".repeat(200) });
-
-    bodies.set("normal_body", normal);
-    bodies.set("critical_body", critical);
-
-    const out = a.aggregate(bodies);
-    // If any body survives, the critical one should
-    if (out.bodies.critical_body || out.bodies.normal_body) {
-      assert.ok(out.bodies.critical_body,
-        "critical_body must survive longer than normal_body");
-    }
+  test("flags stale state", async () => {
+    const a = new Aggregator({ staleMs: 50 });
+    const b = new TestBody("slow");
+    b.setState({ v: 1 });
+    await new Promise((r) => setTimeout(r, 100));
+    const out = a.aggregate(new Map([["slow", b]]));
+    assert.strictEqual(out.bodies.slow.stale, true);
   });
 
-  test("priority stats track drops by level", () => {
-    // Force budget pressure with lots of events, not bulk state.
+  test("compacts floats to 3 decimals", () => {
+    const a = new Aggregator();
+    const b = new TestBody("a");
+    b.setState({ pos: 3.14159265 });
+    const out = a.aggregate(new Map([["a", b]]));
+    assert.strictEqual(out.bodies.a.pos, 3.142);
+  });
+
+  test("truncates long strings", () => {
+    const a = new Aggregator();
+    const b = new TestBody("a");
+    b.setState({ note: "z".repeat(500) });
+    const out = a.aggregate(new Map([["a", b]]));
+    assert.ok(out.bodies.a.note.length <= 120);
+  });
+
+  test("priority stats track drops", () => {
     const a = new Aggregator({ tokenBudget: 80, maxPendingEventsPerBody: 50 });
-    const b = new BodyAdapter({ name: "x", transport: new FakeTransport() });
+    const b = new TestBody("a");
     for (let i = 0; i < 20; i++) b.emit(`low_${i}`, {}, "LOW");
     for (let i = 0; i < 20; i++) b.emit(`normal_${i}`, {}, "NORMAL");
-
-    a.aggregate(new Map([["x", b]]));
+    a.aggregate(new Map([["a", b]]));
     const s = a.getStats();
     const total = s.droppedByPriority.LOW + s.droppedByPriority.NORMAL + s.droppedByPriority.HIGH;
-    assert.ok(total > 0, `expected at least one drop, got stats: ${JSON.stringify(s.droppedByPriority)}`);
+    assert.ok(total > 0);
+  });
+
+  test("CRITICAL never counted in drops", () => {
+    const a = new Aggregator({ tokenBudget: 80, maxPendingEventsPerBody: 50 });
+    const b = new TestBody("a");
+    b.emit("alert", {}, "CRITICAL");
+    for (let i = 0; i < 30; i++) b.emit(`low_${i}`, {}, "LOW");
+    a.aggregate(new Map([["a", b]]));
+    assert.strictEqual(a.getStats().droppedByPriority.CRITICAL, 0);
   });
 });

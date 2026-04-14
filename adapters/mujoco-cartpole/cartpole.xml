@@ -1,0 +1,24 @@
+<mujoco model="scp-cartpole">
+  <option timestep="0.02" gravity="0 0 -9.81"/>
+
+  <worldbody>
+    <light diffuse="1 1 1" pos="0 0 3" dir="0 0 -1"/>
+    <geom name="floor" type="plane" size="5 5 0.1" rgba="0.3 0.3 0.3 1"/>
+    <geom name="rail" type="capsule" fromto="-2 0 0.5 2 0 0.5" size="0.02" rgba="0.6 0.6 0.6 1"/>
+
+    <body name="cart" pos="0 0 0.5">
+      <joint name="cart_slide" type="slide" axis="1 0 0" range="-2 2" damping="0.5"/>
+      <geom name="cart_geom" type="box" size="0.2 0.15 0.1" rgba="0.2 0.4 0.8 1" mass="1"/>
+
+      <body name="pole" pos="0 0 0.1">
+        <joint name="pole_hinge" type="hinge" axis="0 1 0" damping="0.01"/>
+        <geom name="pole_geom" type="capsule" fromto="0 0 0 0 0 0.6" size="0.03" rgba="0.9 0.2 0.2 1" mass="0.1"/>
+        <geom name="pole_tip" type="sphere" pos="0 0 0.6" size="0.05" rgba="1 0.8 0 1"/>
+      </body>
+    </body>
+  </worldbody>
+
+  <actuator>
+    <motor joint="cart_slide" ctrlrange="-3 3" ctrllimited="true" gear="50"/>
+  </actuator>
+</mujoco>

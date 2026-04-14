@@ -1,15 +1,12 @@
-// Translator -- JOB 1: convert LLM intent into an SCP command.
-// Validates the intent against known bodies and their declared capabilities.
-// Returns a structured command object or a structured error.
-// Never throws. The caller (Space) decides what to do with errors.
+// Translator -- validate a structured tool call from the brain.
+// Input: { target_body, tool, parameters, priority?, fallback? }
+// Output: { ok: true, command } or { ok: false, reason, error }
+// Never throws. No text parsing -- LLM must return structured JSON.
 
 class Translator {
-  /**
-   * @param {object} [opts]
-   * @param {Set<string>} [opts.allowedActions] - optional global allowlist
-   */
   constructor(opts = {}) {
-    this.allowedActions = opts.allowedActions || null;
+    // Optional global allowlist: Set of "bodyName.toolName"
+    this.allowedTools = opts.allowedTools || null;
 
     this.stats = {
       translated: 0,
@@ -19,28 +16,27 @@ class Translator {
   }
 
   /**
-   * Translate an LLM intent into an SCP command.
-   * @param {object} intent - parsed from Brain.invoke()
-   * @param {Map<string, BodyAdapter>} bodies - Space.bodies
-   * @returns {{ ok: true, command: object } | { ok: false, error: string, reason: string }}
+   * @param {object} intent - structured brain output
+   * @param {Map<string, BodyAdapter>} bodies
+   * @returns {{ok:true, command:object} | {ok:false, reason:string, error:string}}
    */
   translate(intent, bodies) {
-    // Input shape
     if (!intent || typeof intent !== "object") {
       return this._reject("invalid_intent", "intent is not an object");
     }
 
-    const { target_body, action, parameters, priority, fallback } = intent;
+    // Accept both { tool } (new) and { action } (legacy) for back-compat
+    const { target_body } = intent;
+    const tool = intent.tool || intent.action;
+    const { parameters, priority, fallback } = intent;
 
-    // Required fields
     if (typeof target_body !== "string" || !target_body) {
       return this._reject("missing_target_body", "target_body must be a non-empty string");
     }
-    if (typeof action !== "string" || !action) {
-      return this._reject("missing_action", "action must be a non-empty string");
+    if (typeof tool !== "string" || !tool) {
+      return this._reject("missing_tool", "tool must be a non-empty string");
     }
 
-    // Body must exist
     const body = bodies && typeof bodies.get === "function" ? bodies.get(target_body) : null;
     if (!body) {
       return this._reject(
@@ -49,33 +45,40 @@ class Translator {
       );
     }
 
-    // Body must declare capability (if it declares any)
-    if (body.capabilities && body.capabilities.size > 0 && !body.capabilities.has(action)) {
+    // Tool must be declared on the body
+    const toolDefs = typeof body.getToolDefinitions === "function"
+      ? body.getToolDefinitions()
+      : (body.constructor && body.constructor.tools) || {};
+
+    if (!toolDefs[tool]) {
       return this._reject(
-        "capability_denied",
-        `body "${target_body}" does not declare action "${action}"`
+        "unknown_tool",
+        `body "${target_body}" does not declare tool "${tool}"`
       );
     }
 
-    // Global allowlist (optional)
-    if (this.allowedActions && !this.allowedActions.has(action)) {
+    // Global tool allowlist check
+    const fqn = `${target_body}.${tool}`;
+    if (this.allowedTools && !this.allowedTools.has(fqn)) {
       return this._reject(
-        "action_not_allowed",
-        `action "${action}" is not in the global allowlist`
+        "tool_not_allowed",
+        `tool "${fqn}" not in global allowlist`
       );
     }
 
-    // Parameters must be a plain object
+    // Parameter validation against declared schema
     const params = (parameters && typeof parameters === "object" && !Array.isArray(parameters))
-      ? parameters
-      : {};
+      ? parameters : {};
 
-    // Priority: clamp to 1-5, default 3
+    const schema = toolDefs[tool].parameters || {};
+    const validationError = this._validateParameters(params, schema);
+    if (validationError) {
+      return this._reject("invalid_parameters", validationError);
+    }
+
     const prio = Number.isFinite(priority)
       ? Math.min(5, Math.max(1, Math.round(priority)))
       : 3;
-
-    // Fallback: non-empty string or "hold_position"
     const fb = (typeof fallback === "string" && fallback) ? fallback : "hold_position";
 
     this.stats.translated++;
@@ -84,7 +87,7 @@ class Translator {
       ok: true,
       command: {
         body: target_body,
-        action,
+        tool,
         parameters: params,
         priority: prio,
         fallback: fb,
@@ -93,7 +96,45 @@ class Translator {
     };
   }
 
-  // -- Internal --
+  // -- Parameter validation (subset of JSON Schema) --
+
+  _validateParameters(params, schema) {
+    if (!schema || typeof schema !== "object") return null;
+
+    for (const [key, def] of Object.entries(schema)) {
+      if (def.required && !(key in params)) {
+        return `missing required parameter "${key}"`;
+      }
+      if (!(key in params)) continue;
+
+      const val = params[key];
+      const type = def.type;
+
+      if (type === "string") {
+        if (typeof val !== "string") return `"${key}" must be string`;
+        if (Array.isArray(def.enum) && !def.enum.includes(val)) {
+          return `"${key}" must be one of [${def.enum.join(", ")}]`;
+        }
+      } else if (type === "number" || type === "integer") {
+        if (typeof val !== "number" || Number.isNaN(val)) {
+          return `"${key}" must be number`;
+        }
+        if (type === "integer" && !Number.isInteger(val)) {
+          return `"${key}" must be integer`;
+        }
+        if (typeof def.min === "number" && val < def.min) {
+          return `"${key}" must be >= ${def.min}`;
+        }
+        if (typeof def.max === "number" && val > def.max) {
+          return `"${key}" must be <= ${def.max}`;
+        }
+      } else if (type === "boolean") {
+        if (typeof val !== "boolean") return `"${key}" must be boolean`;
+      }
+      // Unknown types are skipped (loose validation)
+    }
+    return null;
+  }
 
   _reject(reason, message) {
     this.stats.rejected++;
