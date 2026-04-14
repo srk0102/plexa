@@ -1,88 +1,75 @@
-// Project G -- hello world
+// Plexa -- hello world (in-process, zero HTTP).
 //
-// Starts the template SCP muscle as a subprocess, connects it via
-// HTTPTransport, wires an OllamaBrain, and runs the Space.
+// Minimal single-body demo. A GreeterBody with one tool, ticked by Plexa at 60fps.
+// If Ollama is available it drives the brain; otherwise a stub brain rotates actions.
 //
-// If Ollama is not available, falls back to a stub brain so the demo
-// still runs end-to-end.
+// Run: node examples/hello-world/index.js
 
-const { spawn } = require("node:child_process");
-const path = require("node:path");
-const { Space, BodyAdapter, Brain, OllamaBrain } = require("../..");
-const { HTTPTransport } = require("scp-protocol");
+const { Space, BodyAdapter, Brain } = require("../..");
+const { OllamaBrain } = require("../../packages/bridges/ollama");
 
-const SPACE_PORT = 3000;
-const MUSCLE_PORT = 8001;
+// -- A tiny body with two tools --
 
-// -- Fallback stub brain (used if Ollama is not running) --
+class GreeterBody extends BodyAdapter {
+  static bodyName = "greeter";
 
-class StubBrain extends Brain {
+  static tools = {
+    say_hello: {
+      description: "Emit a hello message with a given name",
+      parameters: {
+        name: { type: "string", required: true },
+      },
+    },
+    wave: {
+      description: "Wave (no parameters)",
+      parameters: {},
+    },
+  };
+
   constructor() {
-    super({ model: "stub" });
-    this._counter = 0;
+    super();
+    this.greetings = 0;
+    this.waves = 0;
   }
-  async _rawCall(prompt) {
-    // Rotate through a few reasonable actions
-    const actions = ["move_to", "halt", "avoid", "engage"];
-    const action = actions[this._counter++ % actions.length];
-    return JSON.stringify({
-      target_body: "cartpole",
-      action,
-      parameters: action === "move_to" ? { x: 0.5, y: 0 } : {},
-      priority: 3,
-      fallback: "halt",
-    });
+
+  async say_hello({ name }) {
+    this.greetings++;
+    this.setState({ last_greeting: name, greetings: this.greetings });
+    this.emit("hello_said", { name }, "NORMAL");
+    return { ok: true, greeted: name };
+  }
+
+  async wave() {
+    this.waves++;
+    this.setState({ waves: this.waves });
+    return { ok: true };
+  }
+
+  async tick() {
+    await super.tick();
+    // Periodic heartbeat so the aggregator always has something to show
+    if (this._tickCount === undefined) this._tickCount = 0;
+    this._tickCount++;
+    if (this._tickCount % 120 === 0) {
+      this.emit("heartbeat", { tick: this._tickCount }, "LOW");
+    }
   }
 }
 
-// -- BodyAdapter that speaks to the template muscle over HTTP --
+// -- Stub brain (rotates between the two tools) --
 
-class TemplateBody extends BodyAdapter {
-  constructor({ transport, musclePort }) {
-    super({
-      name: "cartpole",
-      capabilities: ["move_to", "halt", "avoid", "engage"],
-      transport,
-    });
-    this.musclePort = musclePort;
-    this.lastHeartbeatTick = 0;
-  }
-
-  async onConfigure() {
-    await super.onConfigure();
-
-    // When the transport receives events from the muscle, push them up.
-    this.transport.on("entity_detected", (msg) => {
-      this.emit("entity_detected", msg.payload || {});
-      if (msg.state) this.setState({ last_entity: (msg.payload || {}).kind });
-    });
-
-    this.transport.on("obstacle_too_close", () => {
-      this.emit("obstacle_too_close", {});
-    });
-
-    this.transport.on("heartbeat", (msg) => {
-      if (msg.payload) this.setState({ heartbeat: msg.payload });
-    });
-  }
-
-  // Override to POST commands directly to the muscle (not via transport broadcast)
-  async _scpCall(method, args) {
-    const http = require("node:http");
-    const body = JSON.stringify({ type: "command", method, args, ts: Date.now() });
-    return new Promise((resolve) => {
-      const req = http.request({
-        method: "POST",
-        hostname: "localhost",
-        port: this.musclePort,
-        path: "/",
-        headers: { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(body) },
-        timeout: 500,
-      }, (res) => { res.on("data", () => {}); res.on("end", () => resolve({ ok: true })); });
-      req.on("error", () => resolve({ ok: false }));
-      req.on("timeout", () => { req.destroy(); resolve({ ok: false }); });
-      req.write(body);
-      req.end();
+class StubBrain extends Brain {
+  constructor() { super({ model: "stub" }); this._i = 0; }
+  async _rawCall() {
+    this._i++;
+    const names = ["world", "plexa", "srk", "friend"];
+    const useHello = this._i % 2 === 0;
+    return JSON.stringify({
+      target_body: "greeter",
+      tool: useHello ? "say_hello" : "wave",
+      parameters: useHello ? { name: names[this._i % names.length] } : {},
+      priority: 3,
+      fallback: "wave",
     });
   }
 }
@@ -90,102 +77,66 @@ class TemplateBody extends BodyAdapter {
 // -- Main --
 
 async function main() {
-  console.log("[project-g] hello-world starting\n");
+  console.log("[plexa] hello-world starting");
+  console.log("[plexa] zero HTTP between Plexa and bodies\n");
 
-  // 1. Start the template muscle as a subprocess
-  const musclePath = path.resolve(__dirname, "../../adapters/template/muscle.js");
-  const muscle = spawn("node", [musclePath], {
-    env: {
-      ...process.env,
-      SCP_PORT: String(MUSCLE_PORT),
-      SPACE_URL: `http://localhost:${SPACE_PORT}`,
-      BODY_NAME: "cartpole",
-    },
-    stdio: "inherit",
+  const space = new Space("hello_world", {
+    tickHz: 60,
+    aggregateEveryTicks: 60,
+    brainIntervalMs: 1500,
   });
 
-  // Give the muscle time to start listening
-  await new Promise((r) => setTimeout(r, 800));
+  const body = new GreeterBody();
+  space.addBody(body);
 
-  // 2. HTTPTransport receives events from the muscle
-  const transport = new HTTPTransport({ port: SPACE_PORT });
-  await transport.start();
-
-  // 3. Pick a brain (Ollama if running, else stub)
-  let brain;
   const ollamaUp = await OllamaBrain.isAvailable();
   if (ollamaUp) {
-    console.log("[project-g] ollama detected -- using llama3.2");
-    brain = new OllamaBrain({ model: "llama3.2" });
+    console.log("[plexa] ollama detected -- using llama3.2");
+    space.setBrain(new OllamaBrain({ model: "llama3.2", maxTokens: 80 }));
   } else {
-    console.log("[project-g] ollama not running -- using stub brain (rotates actions)");
-    brain = new StubBrain();
+    console.log("[plexa] ollama not running -- using stub brain");
+    space.setBrain(new StubBrain());
   }
 
-  // 4. Assemble the Space
-  const space = new Space("hello_world", {
-    tickHz: 120,
-    aggregateEveryTicks: 60,  // aggregate every 500ms
-    brainIntervalMs: 2000,    // brain call every 2s max
-  });
+  space.setGoal("greet the world periodically");
 
-  space.addBody(new TemplateBody({ transport, musclePort: MUSCLE_PORT }));
-  space.setBrain(brain);
-  space.setGoal("stay safe and explore the environment");
+  space.on("tool_dispatched", (e) =>
+    console.log(`[plexa] ${e.body}.${e.tool}(${JSON.stringify(e.parameters)})`));
+  space.on("intent_error", (e) => console.log(`[plexa] intent rejected: ${e.reason}`));
+  space.on("brain_error", (e) => console.log(`[plexa] brain error: ${e.message}`));
 
-  space.on("intent_error", (e) => {
-    console.log(`[space] intent rejected: ${e.reason} -- ${e.error}`);
-  });
-  space.on("brain_error", (e) => {
-    console.log(`[space] brain error: ${e.message}`);
-  });
-
-  // 5. Run it
   await space.run();
+  console.log(`[plexa] space running at ${space.tickHz}Hz\n`);
 
-  console.log(`\n[project-g] space running at ${SPACE_PORT}Hz\n`);
-
-  // Print stats every 3 seconds for 15 seconds total
-  let loops = 0;
   const totalLoops = 5;
-  const statsInterval = setInterval(() => {
-    loops++;
+  let loop = 0;
+  const timer = setInterval(() => {
+    loop++;
     const s = space.getStats();
     console.log(
-      `  Loop ${loops}: brain=${s.brainCalls}  dispatched=${s.commandsDispatched}  ` +
-      `rejected=${s.commandsRejected}  errors=${s.brainErrors}  ` +
-      `agg=${s.aggregations}`
+      `  Loop ${loop}: tick=${s.tick} brain=${s.brainCalls} tools=${s.toolsDispatched} ` +
+      `greetings=${body.greetings} waves=${body.waves}`
     );
-
-    if (loops >= totalLoops) {
-      clearInterval(statsInterval);
+    if (loop >= totalLoops) {
+      clearInterval(timer);
       cleanup();
     }
   }, 3000);
 
   async function cleanup() {
-    console.log("\n[project-g] shutting down...\n");
+    console.log("\n[plexa] shutting down...");
     await space.stop();
-    await transport.stop();
-    muscle.kill();
-
     const s = space.getStats();
-    console.log("=== Final Stats ===");
-    console.log(`  Brain calls:         ${s.brainCalls}`);
-    console.log(`  Brain errors:        ${s.brainErrors}`);
-    console.log(`  Commands dispatched: ${s.commandsDispatched}`);
-    console.log(`  Commands rejected:   ${s.commandsRejected}`);
-    console.log(`  Aggregations:        ${s.aggregations}`);
-    console.log(`  Reactor ticks:       ${s.tick}`);
-    console.log(`  Translator rejects:  ${JSON.stringify(s.translator.byReason)}`);
-    console.log(`  Aggregator max tok:  ${s.aggregator.maxTokens}`);
-    if (s.brain) console.log(`  Avg brain call:      ${s.brain.avgCallMs}ms`);
-
+    console.log("\n=== Final Stats ===");
+    console.log(`  Reactor ticks:     ${s.tick}`);
+    console.log(`  Brain calls:       ${s.brainCalls}`);
+    console.log(`  Tools dispatched:  ${s.toolsDispatched}`);
+    console.log(`  Tools rejected:    ${s.toolsRejected}`);
+    console.log(`  Tool errors:       ${s.toolErrors}`);
+    console.log(`  Greetings:         ${body.greetings}`);
+    console.log(`  Waves:             ${body.waves}`);
     process.exit(0);
   }
 }
 
-main().catch((e) => {
-  console.error("[project-g] fatal:", e);
-  process.exit(1);
-});
+main().catch((e) => { console.error("fatal:", e); process.exit(1); });

@@ -1,76 +1,123 @@
-// Plexa -- two bodies, one brain.
-// template adapter on port 8001 + MuJoCo cartpole on port 8002.
-// One Ollama/stub brain coordinates both simultaneously.
+// Plexa -- two bodies, one brain (in-process, zero HTTP).
+//
+// A CartpoleBody (pure JS physics) and a LightBody (toggle state) share one Space.
+// One brain coordinates both simultaneously.
 //
 // Run: node examples/two-bodies/index.js
-// The MuJoCo window will open visibly while the template runs headless.
 
-const { spawn, spawnSync } = require("node:child_process");
-const path = require("node:path");
-const http = require("node:http");
-const fs = require("node:fs");
+const { Space, BodyAdapter, Brain } = require("../..");
+const { OllamaBrain } = require("../../packages/bridges/ollama");
 
-// Resolve a real Python interpreter, not the Microsoft Store stub.
-function resolvePython() {
-  if (process.platform !== "win32") return "python3";
+// -- Cartpole physics (simplified, visually plausible) --
 
-  // 1. Try pyenv-win location
-  const home = process.env.USERPROFILE || process.env.HOME || "";
-  const pyenvDir = path.join(home, ".pyenv", "pyenv-win", "versions");
-  try {
-    if (fs.existsSync(pyenvDir)) {
-      const versions = fs.readdirSync(pyenvDir).sort().reverse();
-      for (const v of versions) {
-        const exe = path.join(pyenvDir, v, "python.exe");
-        if (fs.existsSync(exe)) return exe;
-      }
+class CartpolePhysics {
+  constructor() { this.reset(); }
+  reset() {
+    this.x = 0; this.v = 0;
+    this.theta = (Math.random() - 0.5) * 0.1;
+    this.omega = 0; this.force = 0;
+  }
+  step(dt = 1 / 60) {
+    const g = 9.8, mC = 1.0, mP = 0.1, L = 0.5;
+    const total = mC + mP;
+    const sinT = Math.sin(this.theta), cosT = Math.cos(this.theta);
+    const temp = (this.force + mP * L * this.omega * this.omega * sinT) / total;
+    const alpha = (g * sinT - cosT * temp) / (L * (4 / 3 - (mP * cosT * cosT) / total));
+    const accX = temp - (mP * L * alpha * cosT) / total;
+    this.v += accX * dt; this.x += this.v * dt;
+    this.omega += alpha * dt; this.theta += this.omega * dt;
+    this.v *= 0.999; this.omega *= 0.999; this.force = 0;
+    if (Math.abs(this.theta) > 1.2 || Math.abs(this.x) > 2.5) {
+      this.reset(); return true;
     }
-  } catch {}
-
-  // 2. Try `py` launcher
-  try {
-    const r = spawnSync("py", ["-c", "import sys;print(sys.executable)"], { encoding: "utf8" });
-    if (r.status === 0) {
-      const p = r.stdout.trim();
-      if (p && fs.existsSync(p)) return p;
-    }
-  } catch {}
-
-  // 3. Fallback
-  return "python";
+    return false;
+  }
+  apply(direction, magnitude = 0.5) {
+    const f = Math.min(1, Math.max(0, magnitude)) * 15;
+    this.force = direction === "left" ? -f : f;
+  }
 }
-const { Space, BodyAdapter, Brain, OllamaBrain } = require("../..");
-const { HTTPTransport } = require("scp-protocol");
 
-const SPACE_PORT = 3000;
-const TEMPLATE_PORT = 8001;
-const CARTPOLE_PORT = 8002;
+class CartpoleBody extends BodyAdapter {
+  static bodyName = "cartpole";
+  static tools = {
+    apply_force: {
+      description: "Apply force to the cart to balance the pole",
+      parameters: {
+        direction: { type: "string", enum: ["left", "right"], required: true },
+        magnitude: { type: "number", min: 0, max: 1, required: true },
+      },
+    },
+    reset: { description: "Reset the cartpole", parameters: {} },
+    hold:  { description: "Apply no force this frame", parameters: {} },
+  };
 
-// -- Fallback stub brain (rotates sensible commands for both bodies) --
+  constructor() { super(); this.physics = new CartpolePhysics(); this._t = 0; }
+
+  async apply_force({ direction, magnitude }) {
+    this.physics.apply(direction, magnitude);
+    return { applied: direction, magnitude };
+  }
+  async reset() { this.physics.reset(); return { ok: true }; }
+  async hold()  { this.physics.force = 0; return { ok: true }; }
+
+  async tick() {
+    await super.tick();
+    const wasReset = this.physics.step();
+    const s = this.physics;
+    this.setState({ cart_pos: s.x, pole_angle: s.theta, pole_vel: s.omega });
+    if (Math.abs(s.theta) > 0.8) this.emit("pole_critical", { angle: round(s.theta) }, "CRITICAL");
+    else if (Math.abs(s.theta) > 0.4) this.emit("pole_warning", { angle: round(s.theta) }, "HIGH");
+    if (wasReset) this.emit("auto_reset", {}, "NORMAL");
+    this._t++;
+    if (this._t % 120 === 0) this.emit("state_update", { angle: round(s.theta) }, "NORMAL");
+  }
+}
+
+// -- A simple toggle body (no physics) --
+
+class LightBody extends BodyAdapter {
+  static bodyName = "light";
+  static tools = {
+    turn_on:  { description: "Turn the light on",  parameters: {} },
+    turn_off: { description: "Turn the light off", parameters: {} },
+    toggle:   { description: "Toggle the light",   parameters: {} },
+  };
+
+  constructor() { super(); this.on = false; this.toggles = 0; }
+
+  async turn_on()  { this.on = true;  this.setState({ on: true }); return { on: true }; }
+  async turn_off() { this.on = false; this.setState({ on: false }); return { on: false }; }
+  async toggle()   {
+    this.on = !this.on;
+    this.toggles++;
+    this.setState({ on: this.on, toggles: this.toggles });
+    this.emit("light_toggled", { on: this.on }, "NORMAL");
+    return { on: this.on };
+  }
+}
+
+function round(n) { return Math.round(n * 1000) / 1000; }
+
+// -- Stub brain: alternates bodies --
 
 class StubBrain extends Brain {
-  constructor() {
-    super({ model: "stub" });
-    this._counter = 0;
-  }
+  constructor() { super({ model: "stub" }); this._i = 0; }
   async _rawCall() {
-    this._counter++;
-    // Alternate between the two bodies so both visibly get commands
-    const n = this._counter;
-    if (n % 3 === 0) {
+    this._i++;
+    if (this._i % 3 === 0) {
       return JSON.stringify({
-        target_body: "template",
-        action: ["move_to", "halt", "avoid"][Math.floor(Math.random() * 3)],
-        parameters: { x: 0.3, y: 0 },
+        target_body: "light",
+        tool: "toggle",
+        parameters: {},
         priority: 3,
-        fallback: "halt",
+        fallback: "turn_off",
       });
     }
-    // Cartpole: decide force direction based on rotation
-    const dir = n % 2 === 0 ? "left" : "right";
+    const dir = this._i % 2 === 0 ? "left" : "right";
     return JSON.stringify({
       target_body: "cartpole",
-      action: "apply_force",
+      tool: "apply_force",
       parameters: { direction: dir, magnitude: 0.4 },
       priority: 4,
       fallback: "hold",
@@ -78,187 +125,80 @@ class StubBrain extends Brain {
   }
 }
 
-// -- Base body that shares one transport and filters by body name --
-
-class SharedTransportBody extends BodyAdapter {
-  constructor({ name, capabilities, transport, musclePort, musclePath }) {
-    super({ name, capabilities, transport });
-    this.musclePort = musclePort;
-    this.musclePath = musclePath || "/";
-  }
-
-  async onConfigure() {
-    await super.onConfigure();
-    // Register listeners that filter by body name
-    const types = [
-      "entity_detected", "obstacle_too_close", "heartbeat",
-      "pole_critical", "pole_warning", "cart_boundary", "state_update",
-    ];
-    for (const type of types) {
-      this.transport.on(type, (msg) => {
-        if (!msg || msg.body !== this.name) return;
-        const priority = msg.priority || "NORMAL";
-        this.emit(type, msg.payload || {}, priority);
-        if (msg.state) this.setState(msg.state);
-      });
-    }
-  }
-
-  // Commands go DIRECTLY to the muscle's HTTP port, not via transport broadcast.
-  async _scpCall(method, args) {
-    const body = JSON.stringify({ type: "command", method, args, ts: Date.now() });
-    return new Promise((resolve) => {
-      const req = http.request({
-        method: "POST", hostname: "localhost", port: this.musclePort,
-        path: this.musclePath,
-        headers: { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(body) },
-        timeout: 500,
-      }, (res) => { res.on("data", () => {}); res.on("end", () => resolve({ ok: true })); });
-      req.on("error", () => resolve({ ok: false }));
-      req.on("timeout", () => { req.destroy(); resolve({ ok: false }); });
-      req.write(body);
-      req.end();
-    });
-  }
-}
-
 // -- Main --
 
 async function main() {
-  console.log("[plexa] two-bodies demo starting\n");
+  console.log("[plexa] two-bodies demo starting");
+  console.log("[plexa] two bodies sharing one brain, zero HTTP\n");
 
-  // 1. Start template muscle (headless, port 8001)
-  const templateMuscle = spawn("node",
-    [path.resolve(__dirname, "../../adapters/template/muscle.js")],
-    {
-      env: { ...process.env, SCP_PORT: String(TEMPLATE_PORT),
-             SPACE_URL: `http://localhost:${SPACE_PORT}`, BODY_NAME: "template" },
-      stdio: ["ignore", "inherit", "inherit"],
-    }
-  );
-
-  // 2. Start cartpole muscle (MuJoCo viewer visible, port 8002)
-  // On Windows, "python" may be the Microsoft Store stub. Resolve to real interpreter.
-  const PYTHON = process.env.PYTHON || resolvePython();
-  const cartpolePath = path.resolve(__dirname, "../../adapters/mujoco-cartpole/muscle.py");
-  const cartpoleArgs = ["--managed"];
-  if (!process.env.PLEXA_HEADLESS) cartpoleArgs.push("--view");
-  console.log(`[plexa] python: ${PYTHON}`);
-  const cartpoleMuscle = spawn(PYTHON, [cartpolePath, ...cartpoleArgs], {
-    env: { ...process.env, SCP_PORT: String(CARTPOLE_PORT),
-           SPACE_URL: `http://localhost:${SPACE_PORT}`, BODY_NAME: "cartpole" },
-    stdio: ["ignore", "inherit", "inherit"],
+  const space = new Space("two_bodies", {
+    tickHz: 60,
+    aggregateEveryTicks: 60,
+    brainIntervalMs: 1500,
   });
 
-  // Give both muscles time to start listening
-  await new Promise((r) => setTimeout(r, 1500));
+  const cart = new CartpoleBody();
+  const light = new LightBody();
+  space.addBody(cart);
+  space.addBody(light);
 
-  // 3. Plexa HTTPTransport receives events from both muscles
-  const transport = new HTTPTransport({ port: SPACE_PORT });
-  await transport.start();
-
-  // 4. Brain: Ollama if available, else stub
-  let brain;
   const ollamaUp = await OllamaBrain.isAvailable();
   if (ollamaUp) {
     console.log("[plexa] ollama detected -- using llama3.2");
-    brain = new OllamaBrain({ model: "llama3.2" });
+    space.setBrain(new OllamaBrain({ model: "llama3.2", maxTokens: 120 }));
   } else {
     console.log("[plexa] ollama not running -- using stub brain (alternates bodies)");
-    brain = new StubBrain();
+    space.setBrain(new StubBrain());
   }
 
-  // 5. Space
-  const space = new Space("two_bodies", {
-    tickHz: 120,
-    aggregateEveryTicks: 60,
-    brainIntervalMs: 2000,
-  });
+  space.setGoal("balance the pole and toggle the light periodically");
 
-  space.addBody(new SharedTransportBody({
-    name: "template",
-    capabilities: ["move_to", "halt", "avoid", "engage"],
-    transport,
-    musclePort: TEMPLATE_PORT,
-  }));
-
-  space.addBody(new SharedTransportBody({
-    name: "cartpole",
-    capabilities: ["apply_force", "reset", "hold"],
-    transport,
-    musclePort: CARTPOLE_PORT,
-  }));
-
-  space.setBrain(brain);
-  space.setGoal("balance the pole while keeping template active");
-
-  // Surface errors so we can see problems
-  space.on("intent_error", (e) =>
-    console.log(`[plexa] intent rejected: ${e.reason} -- ${e.error}`));
-  space.on("brain_error", (e) =>
-    console.log(`[plexa] brain error: ${e.message}`));
+  space.on("tool_dispatched", (e) =>
+    console.log(`[plexa] ${e.body}.${e.tool}(${JSON.stringify(e.parameters)})`));
   space.on("body_event", (e) => {
-    const tag = e.priority === "CRITICAL" ? " [CRITICAL]" : "";
-    if (e.priority === "CRITICAL" || e.priority === "HIGH") {
-      console.log(`[plexa] event${tag}: ${e.body} -> ${e.type}`);
+    if (e.priority === "CRITICAL") {
+      console.log(`[plexa] [CRITICAL] ${e.body} -> ${e.type} ${JSON.stringify(e.payload)}`);
     }
   });
+  space.on("intent_error", (e) => console.log(`[plexa] intent rejected: ${e.reason}`));
+  space.on("brain_error", (e) => console.log(`[plexa] brain error: ${e.message}`));
 
   await space.run();
-
   for (const [name] of space.bodies) {
-    console.log(`[plexa] body "${name}" connected (managed)`);
+    console.log(`[plexa] body "${name}" registered`);
   }
-  console.log("");
+  console.log(`[plexa] space running at ${space.tickHz}Hz\n`);
 
-  // 6. Stats loop
-  let loops = 0;
-  const totalLoops = 10;
-
-  const printer = setInterval(() => {
-    loops++;
+  const totalLoops = 8;
+  let loop = 0;
+  const timer = setInterval(() => {
+    loop++;
     const s = space.getStats();
-    const tokens = s.aggregator.maxTokens;
     console.log(
-      `  Loop ${String(loops).padStart(2)}: ` +
-      `brain=${s.brainCalls} dispatched=${s.commandsDispatched} ` +
-      `rejected=${s.commandsRejected} bodies=${s.bodies} tokens=${tokens}`
+      `  Loop ${String(loop).padStart(2)}: ` +
+      `tick=${s.tick} brain=${s.brainCalls} tools=${s.toolsDispatched} ` +
+      `angle=${(cart.physics.theta).toFixed(2)} light=${light.on ? "on" : "off"} toggles=${light.toggles}`
     );
-
-    if (loops >= totalLoops) {
-      clearInterval(printer);
+    if (loop >= totalLoops) {
+      clearInterval(timer);
       cleanup();
     }
   }, 3000);
 
   async function cleanup() {
-    console.log("\n[plexa] shutting down...\n");
+    console.log("\n[plexa] shutting down...");
     await space.stop();
-    await transport.stop();
-    try { templateMuscle.kill(); } catch {}
-    try { cartpoleMuscle.kill(); } catch {}
-
     const s = space.getStats();
-    console.log("=== Final Stats ===");
-    console.log(`  Bodies:                ${s.bodies}`);
-    console.log(`  Brain calls:           ${s.brainCalls}`);
-    console.log(`  Brain errors:          ${s.brainErrors}`);
-    console.log(`  Commands dispatched:   ${s.commandsDispatched}`);
-    console.log(`  Commands rejected:     ${s.commandsRejected}`);
-    console.log(`  Aggregations:          ${s.aggregations}`);
-    console.log(`  Reactor ticks:         ${s.tick}`);
-    console.log(`  Max tokens:            ${s.aggregator.maxTokens}`);
-    console.log(`  Events dropped:        ${s.aggregator.droppedEvents}`);
-    console.log(`  Dropped by priority:   ${JSON.stringify(s.aggregator.droppedByPriority)}`);
-    console.log(`  Translator rejects:    ${JSON.stringify(s.translator.byReason)}`);
-    if (s.brain && typeof s.brain.avgCallMs === "number")
-      console.log(`  Avg brain call:        ${s.brain.avgCallMs}ms`);
-
+    console.log("\n=== Final Stats ===");
+    console.log(`  Bodies:            ${s.bodies}`);
+    console.log(`  Reactor ticks:     ${s.tick}`);
+    console.log(`  Brain calls:       ${s.brainCalls}`);
+    console.log(`  Tools dispatched:  ${s.toolsDispatched}`);
+    console.log(`  Tools rejected:    ${s.toolsRejected}`);
+    console.log(`  Tool errors:       ${s.toolErrors}`);
+    console.log(`  Light toggles:     ${light.toggles}`);
     process.exit(0);
   }
 }
 
-main().catch((e) => {
-  console.error("[plexa] fatal:", e);
-  process.exit(1);
-});
+main().catch((e) => { console.error("fatal:", e); process.exit(1); });
