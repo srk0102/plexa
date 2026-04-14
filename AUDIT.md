@@ -10,6 +10,52 @@ No padding. No encouragement. Facts.
 
 ## Update log
 
+**2026-04-14 late -- v0.5.1 positioning + docs**
+
+Positioning changes:
+- Both READMEs reframed from "embodied AI / one body" to "any continuously running system". New tagline: *Any LLM. Any continuously running system. Brain teaches once. System remembers forever.* Plexa: *One brain. Many systems.*
+- Added three explicit example domains (game AI, robotics, simulation) plus a fourth (web backends) linked to the new docs example.
+- Added an honest "when does the brain wake?" paragraph to the README and a full section in `scp/how-it-works.mdx`. Documents the confidence-threshold gate, the risks of tuning it too high or too low, and the role of `explorationRate` as a drift safety valve.
+- Reframed cost language across READMEs and docs: "brain decisions cached locally" instead of "system learned"; "drops as novelty decreases" instead of "drops to zero"; explicit caveat that *novel situations always wake the brain* and *cost is proportional to novelty*.
+
+Docs status (15 pages live on Mintlify):
+
+| Page | Words |
+|---|---:|
+| introduction.mdx | 183 |
+| getting-started.mdx | 227 |
+| scp/introduction.mdx | 374 |
+| scp/how-it-works.mdx | 535 + novelty section (~280) |
+| scp/adapter-guide.mdx | 741 |
+| scp/pattern-store.mdx | 664 |
+| scp/bridges.mdx | 447 |
+| scp/api.mdx | 695 |
+| plexa/introduction.mdx | 419 |
+| plexa/how-it-works.mdx | 592 |
+| plexa/body-guide.mdx | 713 |
+| plexa/memory.mdx | 516 |
+| plexa/safety.mdx | 572 |
+| plexa/api.mdx | 930 |
+| examples/cart-pole.mdx | 846 |
+| examples/two-bodies.mdx | 636 |
+| examples/web-backend.mdx | 690 |
+
+Production readiness (revised):
+- JS single-body SCP and JS multi-body Plexa: usable today. Confidence threshold defaults are conservative; tune per use case.
+- Web-backend pattern: documented as one example; no Prometheus / Datadog wiring shipped, no human-approval UI shipped, no traffic simulator.
+- Python bodies: the network body contract is documented and the cart-pole adapter exists; there is still no `pip install`-shaped Python SDK.
+- Game NPC pattern: documented as a use case; no Godot / Unity plugin.
+
+Still not started (unchanged):
+- CRDT cross-body shared state.
+- Process isolation per body.
+- Python SDK published to PyPI.
+- Godot / Unity plugins.
+- Multi-region Plexa coordination.
+- Authenticated introspection server.
+
+---
+
 **2026-04-14 evening -- v0.5.0 community-ready cut**
 
 scp-protocol 0.3.3 -> 0.5.0:

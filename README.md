@@ -3,10 +3,11 @@
 </p>
 
 <p align="center">
-  <strong>One brain. Many bodies.</strong>
+  <strong>One brain. Many systems.</strong>
   <br/>
-  Orchestration framework for embodied AI. Built on
-  <a href="https://www.npmjs.com/package/scp-protocol">scp-protocol</a>.
+  Coordinate any number of continuously running systems under one LLM brain.
+  <br/>
+  Built on <a href="https://www.npmjs.com/package/scp-protocol">scp-protocol</a>.
 </p>
 
 <p align="center">
@@ -22,7 +23,7 @@
 
 [![Watch the demo](https://res.cloudinary.com/still-studying/video/upload/so_3/Screen_Recording_2026-04-13_010202_qlnftl.jpg)](https://res.cloudinary.com/still-studying/video/upload/Screen_Recording_2026-04-13_010202_qlnftl.mp4)
 
-Plexa ticks the body at 60Hz, the body consults its local pattern cache first, and the LLM brain is called only when the cache misses.
+Plexa ticks the body at 60Hz, the body consults its local pattern cache first, and the LLM brain is called only when the cache misses. Brain decisions are then cached locally so familiar situations no longer wake the brain. Novel situations always wake the brain. Cost is proportional to novelty.
 
 ---
 
