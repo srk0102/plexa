@@ -59,15 +59,22 @@ These three layers never overlap. Plexa is not a brain. It is a sequencer.
 
 ## Transport truth
 
-| Hop | Mechanism | Latency |
-|------|-----------|---------|
-| Body -> Plexa | direct function call (in-process) | 0-1 ms |
-| Plexa -> LLM | HTTP (always remote) | ~500 ms |
-| Plexa -> Hardware body | HTTP (only when physically separate) | network round-trip |
+| Connection | Transport | Latency |
+|---|---|---|
+| JS Body -> Plexa | function call | 0 ms |
+| Python Body -> Plexa | HTTP | 1-5 ms |
+| Plexa -> LLM | HTTP | 500 ms+ |
 
-**Zero HTTP between body and Plexa.** That is the architectural guarantee.
+**Zero HTTP between JS bodies and Plexa.** HTTP only where physically necessary.
 
-A body is a class. Tools are its async methods. Plexa calls `body.invokeTool(name, params)` directly. No serialization, no transport, no parsing. HTTP exists only at the LLM boundary and (optionally) when a body lives on a different machine.
+A body is a class. Tools are its async methods. By default `transport = "inprocess"`, no port, no network. Plexa calls `body.invokeTool(name, params)` directly. To run a body in another process, mark it explicitly:
+
+```javascript
+class MuJoCoCartpole extends BodyAdapter {
+  static transport = "http"
+  static port = 8002
+}
+```
 
 ---
 
