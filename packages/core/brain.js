@@ -56,14 +56,24 @@ class Brain {
 
       if (state.mode) lines.push(`  mode: ${state.mode}`);
 
-      // Tool definitions for this body
+      // Tool definitions for this body (include full parameter spec so the
+      // LLM knows types and enum constraints)
       if (state.tools) {
         lines.push(`  tools:`);
         for (const [tName, tDef] of Object.entries(state.tools)) {
           lines.push(`    ${tName}: ${tDef.description || ""}`);
-          if (tDef.parameters) {
-            const keys = Object.keys(tDef.parameters).join(", ") || "none";
-            lines.push(`      params: ${keys}`);
+          if (tDef.parameters && Object.keys(tDef.parameters).length > 0) {
+            for (const [pName, pDef] of Object.entries(tDef.parameters)) {
+              const parts = [];
+              if (pDef.type) parts.push(pDef.type);
+              if (Array.isArray(pDef.enum)) parts.push(`one of [${pDef.enum.map(v => JSON.stringify(v)).join(", ")}]`);
+              if (typeof pDef.min === "number") parts.push(`min ${pDef.min}`);
+              if (typeof pDef.max === "number") parts.push(`max ${pDef.max}`);
+              if (pDef.required) parts.push("required");
+              lines.push(`      ${pName}: ${parts.join(", ") || "any"}`);
+            }
+          } else {
+            lines.push(`      (no parameters)`);
           }
         }
       }

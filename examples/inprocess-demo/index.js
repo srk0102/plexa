@@ -175,7 +175,7 @@ async function main() {
   const space = new Space("inprocess_demo", {
     tickHz: 60,
     aggregateEveryTicks: 60,  // aggregate once per second
-    brainIntervalMs: 2000,
+    brainIntervalMs: 1500,    // brain call at most every 1.5s
   });
 
   const body = new CartpoleBody();
@@ -200,8 +200,16 @@ async function main() {
 
   const ollamaUp = await OllamaBrain.isAvailable();
   if (ollamaUp) {
-    console.log("[plexa] ollama detected -- using llama3.2");
-    space.setBrain(new OllamaBrain({ model: "llama3.2" }));
+    console.log("[plexa] ollama detected -- using llama3.2 (warming up...)");
+    const ollama = new OllamaBrain({ model: "llama3.2", maxTokens: 80 });
+    // Pre-warm so the first cold call doesn't burn the demo budget
+    try {
+      await ollama.invoke({ bodies: {}, active_goal: "warmup" });
+      console.log(`[plexa] warmup ok (${ollama.lastCallMs}ms)`);
+    } catch (e) {
+      console.log(`[plexa] warmup error: ${e.message}`);
+    }
+    space.setBrain(ollama);
   } else {
     console.log("[plexa] ollama not running -- using stub brain");
     space.setBrain(new StubBrain());
