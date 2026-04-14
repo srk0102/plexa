@@ -14,13 +14,15 @@
     "./core/brain": "./packages/core/brain.js",
     "./core/translator": "./packages/core/translator.js",
     "./core/aggregator": "./packages/core/aggregator.js",
+    "./core/vertical-memory": "./packages/core/vertical-memory.js",
+    "./core/network-body": "./packages/core/network-body.js",
     "./bridges/ollama": "./packages/bridges/ollama.js",
     "./bridges/bedrock": "./packages/bridges/bedrock.js",
     "./bridges/anthropic": "./packages/bridges/anthropic.js",
     "./introspection": "./packages/core/introspection.js"
   },
   "scripts": {
-    "test": "node --test tests/plexa.test.js tests/managed-mode.test.js tests/bridges.test.js tests/safety-approval.test.js tests/injection.test.js",
+    "test": "node --test tests/plexa.test.js tests/managed-mode.test.js tests/bridges.test.js tests/safety-approval.test.js tests/injection.test.js tests/network-body.test.js tests/confidence-lateral.test.js tests/vertical-memory.test.js tests/cost-retry.test.js tests/integration.test.js",
     "hello": "node examples/hello-world/index.js",
     "cli": "node bin/plexa"
   },
@@ -41,7 +43,7 @@
     "node": ">=18.0.0"
   },
   "dependencies": {
-    "scp-protocol": "^0.3.0"
+    "scp-protocol": "^0.5.0"
   },
   "files": [
     "index.js",
@@ -50,5 +52,8 @@
     "assets/logo/",
     "LICENSE",
     "README.md"
-  ]
+  ],
+  "devDependencies": {
+    "better-sqlite3": "^12.9.0"
+  }
 }

@@ -28,7 +28,19 @@ Plexa ticks the body at 60Hz, the body consults its local pattern cache first, a
 
 ## Overview
 
-Plexa runs a single-process tick loop, aggregates every body's state into a brain prompt, dispatches the brain's tool intent as a direct async method call on the body.
+Plexa runs a single-process tick loop, aggregates every body's state into a brain prompt, dispatches the brain's tool intent as a direct async method call on the body, and owns the cross-session memory that makes the LLM quieter every run.
+
+```
+Sensor
+  -> Reflex        (in-body, 0 ms)
+    -> PatternStore      (scp-protocol, layer 2)
+      -> AdaptiveMemory  (scp-protocol, layer 3)
+        -> VerticalMemory  (plexa, cross-session)
+          -> LLM brain     (Ollama / Bedrock / Anthropic)
+              |
+              Safety Rules -> Approval Hook -> body.invokeTool
+              Body A  <--(lateral events, zero-latency)-->  Body B
+```
 
 Plexa is built on [`scp-protocol`](https://www.npmjs.com/package/scp-protocol). Use `scp-protocol` directly when you have one body. Use Plexa when you have several bodies and want one LLM to coordinate them.
 
@@ -44,11 +56,60 @@ Node >= 18. One production dependency: `scp-protocol`. Plexa's own core has no o
 
 - Runs a 60Hz reactor loop that ticks every registered body each frame.
 - Aggregates each body's state and events into a prompt that fits a configurable token budget (default 2000), trimming by event priority.
-- Calls a brain (OllamaBrain, or a subclass you write) at most every `brainIntervalMs`.
+- Consults `VerticalMemory` before calling the brain so repeat situations skip the LLM entirely.
+- Calls a brain (Ollama / Bedrock / Anthropic / your subclass) at most every `brainIntervalMs`. Brain base class handles retries on 5xx / 429 / network errors with exponential backoff and tracks per-call cost.
+- Runs a hard safety gate (sync rules, cannot be bypassed) and an optional human-in-the-loop approval hook before dispatch.
 - Validates the brain's tool intent against the body's declared schema, then dispatches as a direct async method call on the body.
+- Auto-wraps a `static transport = "http"` body in a `NetworkBodyAdapter` that polls `/state`+`/events` and POSTs tool calls to `/tool`. If `static tools` is empty Plexa calls `/discover` and registers them.
+- Routes lateral body-to-body events directly (no brain, no broadcast) via `space.link(from, to, [types])`.
+- Sanitizes sensor payloads for prompt-injection patterns before they reach the LLM.
+- Saves `VerticalMemory` and every body's pattern store on `stop()` and on `SIGINT/SIGTERM` when `installShutdownHandlers()` is called.
 - Exposes an HTTP introspection server on port 4747 for the `plexa` CLI (status, bodies, logs).
 
-It is a sequencer and a prompt packer, not a planner or a safety layer. The brain chooses the tool; Plexa only validates and dispatches it.
+It is a sequencer with gated dispatch and cross-session memory, not a planner. The brain chooses the tool; Plexa validates, gates, and dispatches it.
+
+---
+
+## 10-minute quick start
+
+```bash
+npm install @srk0102/plexa
+```
+
+```javascript
+const { Space, BodyAdapter, VerticalMemory } = require("@srk0102/plexa")
+const { OllamaBrain } = require("@srk0102/plexa/bridges/ollama")
+
+class Cart extends BodyAdapter {
+  static bodyName = "cart"
+  static tools = {
+    apply_force: {
+      description: "push to balance",
+      parameters: {
+        direction: { type: "string", enum: ["left", "right"], required: true },
+        magnitude: { type: "number", min: 0, max: 1, required: true },
+      },
+    },
+  }
+  async apply_force({ direction, magnitude }) { /* drive hardware */ }
+  async tick() { await super.tick(); this.setState({ pole_angle: readAngle() }) }
+}
+
+const space = new Space("balancer", {
+  verticalMemory: new VerticalMemory({ spaceName: "balancer", dbPath: "./plexa.db" }),
+})
+space.addBody(new Cart())
+space.setBrain(new OllamaBrain({ model: "llama3.2" }))
+space.addSafetyRule((cmd) =>
+  cmd.tool === "apply_force" && cmd.parameters.magnitude > 0.9
+    ? { allowed: false, reason: "magnitude too high" }
+    : { allowed: true }
+)
+space.installShutdownHandlers()
+await space.run()
+```
+
+That is a real, reviewable, persistable robot control loop. 60Hz body tick, local pattern-store muscle, cross-session memory, safety gate, an LLM brain that retries on 429 and tracks cost.
 
 ---
 
@@ -156,6 +217,110 @@ In managed mode the body continues to resolve decisions locally via its own `scp
 
 ---
 
+## Vertical memory
+
+`VerticalMemory` lives at the Space level and remembers what the brain decided for a given world state. On the next brain tick Plexa searches memory first; a confident match skips the LLM entirely.
+
+```javascript
+const mem = new VerticalMemory({ spaceName: "robot", dbPath: "./plexa.db", hitThreshold: 0.85 })
+const space = new Space("robot", { verticalMemory: mem })
+```
+
+Storage: SQLite when `dbPath` is given (requires `better-sqlite3`), otherwise in-memory only. Similarity is Jaccard across bodies + tools + events + goal. Stats in `space.getStats().verticalMemory` and `space.stats.memoryHits / memoryMisses / memoryHitRate`.
+
+---
+
+## Lateral events
+
+Bodies communicate directly, without the brain, without broadcast:
+
+```javascript
+class LeftArm extends BodyAdapter {
+  async onPeerEvent(from, type, payload) {
+    if (type === "grip_slip") await this.compensate(payload.force)
+  }
+}
+
+space.link("right_arm", "left_arm", ["grip_slip", "balance_shift"])
+await rightArm.sendToPeer("left_arm", "grip_slip", { force: 3 })
+```
+
+Direct async method call in-process. Zero latency. Plexa not in the routing path. Self-links are silently ignored.
+
+---
+
+## Safety rules and approval hook
+
+```javascript
+space.addSafetyRule((cmd) =>
+  cmd.tool === "fire" ? { allowed: false, reason: "never fire" } : { allowed: true }
+)
+
+space.addApprovalHook(async (cmd) => {
+  if (cmd.tool === "move" && cmd.parameters.speed > 0.8) {
+    return { ...cmd, parameters: { speed: 0.5 } }  // modify
+  }
+  return true  // or false to reject
+})
+```
+
+Safety rules run first, cannot be bypassed, and the first blocker wins. The approval hook runs after safety and may approve, reject, or return a modified command.
+
+---
+
+## Confidence gating
+
+```javascript
+space.setConfidenceThresholds({
+  autoApprove: 0.9,   // act silently
+  monitor:     0.6,   // act and emit "confidence_warning"
+  escalate:    0.0,   // emit "confidence_escalation"
+})
+```
+
+Decisions reported by bodies via `decideLocally` carry a confidence score. Plexa classifies each one and exposes per-body averages in `stats.avgConfidenceByBody`.
+
+---
+
+## Cost tracking and retry
+
+Brain base class tracks per-call input + output tokens and accumulated USD cost using a built-in table (Nova Micro, Claude Haiku, GPT-4o Mini, and local models at $0). Access via `brain.stats()` or `space.getStats().estimatedCostUSD` and `costSavedByCacheUSD`.
+
+Retry defaults: `maxRetries: 2`, `retryDelayMs: 1000` with exponential backoff on 429. Network errors and 5xx retry; 4xx (except 429) do not.
+
+---
+
+## Prompt-injection sanitizer
+
+The aggregator strips role prefixes (`system:/user:/assistant:/human:`), chat template tokens (`<|...|>`), Anthropic `\n\nHuman:` markers, and known jailbreak directive phrases from body-supplied strings before they reach the brain. Tool definitions are preserved unchanged. Hits increment `stats.injectionHits` and a `security_event` fires.
+
+Opt out per space: `new Space(name, { sanitizeInjection: false })`.
+
+---
+
+## Network bodies
+
+Declare transport on the body class and Plexa auto-wraps it:
+
+```javascript
+class MuJoCoCart extends BodyAdapter {
+  static bodyName = "cart"
+  static transport = "http"
+  static tools = { /* or leave empty to discover at runtime */ }
+}
+space.addBody(new MuJoCoCart({ port: 8002 }))
+await space.ready()   // waits for /discover if tools were empty
+```
+
+Remote body contract:
+- `GET /discover` returns `{ tools: { ... } }`
+- `GET /health` returns `{ ok: true }`
+- `GET /state` returns `{ data: { ... } }`
+- `GET /events` drains a queue of `{ events: [{ type, payload, priority }] }`
+- `POST /tool` receives `{ name, parameters }` and returns the tool result
+
+---
+
 ## Tool intent contract
 
 A brain response must be valid JSON matching:
@@ -211,38 +376,47 @@ No dependencies beyond `node:http`. No bearer-token auth yet: treat the port as 
 npm test
 ```
 
-92 tests across 14 suites. Built-in `node:test`, no test framework dependency.
+181 tests across 40 suites. Built-in `node:test`, no test framework dependency.
 
-| File                | Tests |
-|---------------------|------:|
-| plexa.test.js       | 82 |
-| managed-mode.test.js| 10 |
+| File                       | Tests |
+|----------------------------|------:|
+| plexa.test.js              | 82 |
+| managed-mode.test.js       | 10 |
+| bridges.test.js            |  8 |
+| safety-approval.test.js    | 15 |
+| injection.test.js          | 10 |
+| network-body.test.js       |  9 |
+| confidence-lateral.test.js | 13 |
+| vertical-memory.test.js    | 11 |
+| cost-retry.test.js         | 13 |
+| integration.test.js        | 10 |
 
-The test suite covers Space lifecycle, addBody transport validation, reactor loop, Aggregator priority trimming, Translator rejection reasons, Brain base class, and managed-mode decision handoff. It does not cover: CLI, introspection server, or the bundled examples. Those are exercised by running them manually.
+`integration.test.js` exercises scp-protocol and plexa together end-to-end: in-process full lifecycle, pattern-store + space, adaptive-memory reducing LLM calls, safety block, approval modify, lateral event with no broadcast, confidence escalation, cost tracking, vertical memory cross-session, network body via mock HTTP server.
 
 ---
 
-## Honest state of the code
+## Honest state of the code (v0.5)
 
 What works:
-- In-process bodies. `examples/inprocess-demo` and both updated `hello-world` / `two-bodies` examples run end to end.
-- Aggregator with CRITICAL-preserving trim cascade.
-- Translator with per-parameter type / enum / min / max / required validation.
-- Ollama bridge over raw `node:http`.
-- CLI with colored output, spinner, and panel rendering using only `node:*`.
+- Four-layer decision stack end-to-end (reflex / pattern / adaptive / brain).
+- In-process bodies. All three bundled examples run end to end.
+- Network bodies with auto-wrap, `/discover`, polling, and POST tool dispatch.
+- Safety gate, approval hook, prompt-injection sanitizer, confidence gating.
+- Vertical memory with SQLite persistence and cross-session reuse.
+- Lateral body-to-body events, zero-latency in-process.
+- Cost tracking + retry + exponential backoff in Brain base class.
+- Ollama, Bedrock, Anthropic brains. Claude Haiku default for Anthropic.
+- Graceful shutdown: `space.installShutdownHandlers()` saves everything.
 
 What exists but has a caveat:
-- `NetworkBodyAdapter` proxies tool calls to a remote body over HTTP, but `Space.addBody` does not yet auto-wrap HTTP-transport bodies in it. You have to instantiate the proxy yourself.
 - Introspection server is unauthenticated. Bind to localhost only.
-- The bundled `scp-protocol` dependency is pinned to `^0.3.0`; the two packages are developed together.
+- `better-sqlite3` must compile on the host. Without it, `VerticalMemory` and `AdaptiveMemory` silently fall back to in-memory only.
 
-What is not implemented yet:
+What is not implemented:
 - CRDT or shared state between bodies.
-- Body-to-body lateral events.
-- Persistent vertical memory across sessions. The current `body_decision` history is in-memory and bounded to the last 10 entries.
-- Safety gate that validates LLM intents against policy before dispatch.
 - Process isolation per body. Bodies share the Node process.
-- Retry and cost tracking in the Brain base class.
+- Python SDK. Python bodies still use raw HTTP against the network body contract.
+- Godot / Unity plugins.
 
 ---
 

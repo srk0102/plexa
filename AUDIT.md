@@ -10,6 +10,41 @@ No padding. No encouragement. Facts.
 
 ## Update log
 
+**2026-04-14 evening -- v0.5.0 community-ready cut**
+
+scp-protocol 0.3.3 -> 0.5.0:
+- **AdaptiveMemory** layer 3 between pattern store and LLM. Similarity-scored store with weighted euclidean distance, k-nearest blending, confidence decay on failure, auto-purge at `failureThreshold`. SQLite persistence via `scp_adaptive` table. 28 tests. Exported from `scp-protocol`.
+- **SCPBody four-layer decision stack**: `decideLocally` consults `patternStore` first, then `adaptiveMemory`, returning `{decision, confidence, source}` where source is `exact | similar | adaptive`. `learnFromBrain(entity, decision)` writes to both cache layers.
+- **Graceful shutdown** helper `installShutdownHandlers()` on SCPBody saves patternStore + adaptiveMemory on SIGINT / SIGTERM.
+- Pattern store save clears stale rows before insert (fixes cross-test pollution).
+
+plexa 0.4.0 -> 0.5.0:
+- **NetworkBodyAdapter rewired**: polls `/state` + `/events` on tick, POSTs `/tool`, discovers tools via `/discover`. `Space.addBody` auto-wraps a plain `BodyAdapter` with `static transport="http"` into a NetworkBodyAdapter proxy. Static tools path is sync; missing tools trigger `/discover` async; `space.ready()` awaits all discoveries.
+- **VerticalMemory** at the Space level. SQLite persistence per space name. Jaccard similarity across bodies + tools + events + goal. `Space` consults memory before brain calls; confident match skips the LLM and writes hit stats. `memoryHits / memoryMisses / memoryHitRate` in `space.getStats()`.
+- **Confidence gating** thresholds `{ autoApprove, monitor, escalate }`. Decisions via `onBodyDecision` emit `confidence_warning` or `confidence_escalation`. Per-body average tracked in `stats.avgConfidenceByBody`.
+- **Lateral body-to-body events**: `space.link(from, to, [types])`, `space.unlink`, `body.sendToPeer`, `body.onPeerEvent`. Zero-latency in-process, no brain involvement, self-links ignored.
+- **Cost tracking** in Brain base class. Per-1k-token USD table covers Nova Micro, Claude Haiku, GPT-4o-mini, local models ($0). `Space.getStats().estimatedCostUSD` and `costSavedByCacheUSD`.
+- **Retry policy** in Brain base class: 2 retries with exponential backoff on 429, retries on network + 5xx, no retry on 4xx.
+- **Space.stop() + installShutdownHandlers()** save vertical memory and each body's pattern store + adaptive memory on stop / SIGINT / SIGTERM.
+- New test files: adaptive-memory (28), network-body (9), confidence-lateral (13), vertical-memory (11), cost-retry (13), integration (10 end-to-end).
+
+Test counts:
+- scp-protocol: 112 -> **145** (145 pass, 0 fail, 0 skip, 41 suites).
+- plexa:       92 -> **181** (181 pass, 0 fail, 0 skip, 40 suites).
+- integration: **10/10** (first tests spanning both packages).
+
+README updates:
+- Both packages' READMEs reflect v0.5 reality. Four-layer diagram on scp-protocol side, full stack diagram + 10-minute quickstart on plexa side. Honest "what is not implemented" sections updated.
+
+Items still not started (unchanged from earlier audit):
+- CRDT cross-body shared state.
+- Process isolation per body.
+- Python SDK.
+- Godot / Unity plugins.
+- Mintlify docs content pages (left as follow-up).
+
+---
+
 **2026-04-14 afternoon -- v0.4.0 cut**
 
 Foundations:

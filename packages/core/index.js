@@ -4,6 +4,7 @@ const { NetworkBodyAdapter } = require("./network-body");
 const { Brain } = require("./brain");
 const { Translator } = require("./translator");
 const { Aggregator } = require("./aggregator");
+const { VerticalMemory } = require("./vertical-memory");
 
 module.exports = {
   Space,
@@ -14,4 +15,5 @@ module.exports = {
   Brain,
   Translator,
   Aggregator,
+  VerticalMemory,
 };

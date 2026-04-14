@@ -7,6 +7,7 @@ const {
   Brain,
   Translator,
   Aggregator,
+  VerticalMemory,
 } = require("./packages/core");
 const { OllamaBrain } = require("./packages/bridges/ollama");
 const { BedrockBrain } = require("./packages/bridges/bedrock");
@@ -22,6 +23,7 @@ module.exports = {
   Brain,
   Translator,
   Aggregator,
+  VerticalMemory,
   OllamaBrain,
   BedrockBrain,
   AnthropicBrain,

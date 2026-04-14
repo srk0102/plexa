@@ -8,6 +8,7 @@
 const { EventEmitter } = require("node:events");
 const { Translator } = require("./translator");
 const { Aggregator } = require("./aggregator");
+const { NetworkBodyAdapter } = require("./network-body");
 
 class Space extends EventEmitter {
   /**
@@ -56,11 +57,31 @@ class Space extends EventEmitter {
     this._safetyRules = [];
     this._approvalHook = null;
 
+    // Confidence gating: thresholds applied to decisions reported by
+    // bodies (via decideLocally / notifyDecision). Brain escalation is
+    // emitted when confidence falls below `escalate`.
+    this.confidenceThresholds = {
+      autoApprove: 0.9,
+      monitor: 0.6,
+      escalate: 0.0,
+    };
+    this._confidenceSums = new Map(); // bodyName -> { sum, count }
+
+    // Lateral body-to-body channels. Map<fromName, Map<eventType, Set<toName>>>
+    this._peerRoutes = new Map();
+
+    // Optional vertical memory (SQLite persistence across sessions).
+    this.verticalMemory = opts.verticalMemory || null;
+
+    // Auto-save guards
+    this._autoSaveInstalled = false;
+
     this._running = false;
     this._tick = 0;
     this._lastBrainCallAt = 0;
     this._brainInFlight = false;
     this._brainResponseQueue = [];
+    this._sessionId = `${name}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 
     this.stats = {
       brainCalls: 0,
@@ -74,6 +95,15 @@ class Space extends EventEmitter {
       safetyBlocked: 0,
       approvalRejected: 0,
       approvalModified: 0,
+      // Confidence gating
+      lowConfidenceCount: 0,
+      escalatedByConfidence: 0,
+      avgConfidenceByBody: {},
+      // Lateral
+      peerEventsRouted: 0,
+      // Memory
+      memoryHits: 0,
+      memoryMisses: 0,
     };
   }
 
@@ -83,33 +113,85 @@ class Space extends EventEmitter {
     if (!adapter || !adapter.name) {
       throw new Error("Space.addBody: adapter must have a name");
     }
+
+    // AUTO-WRAP: a plain BodyAdapter with transport="http" becomes a
+    // NetworkBodyAdapter pointing at the declared host:port. Auto-wrap is
+    // skipped if the adapter is already a NetworkBodyAdapter.
+    if (
+      adapter.transport === "http" &&
+      !(adapter instanceof NetworkBodyAdapter)
+    ) {
+      const declaredTools =
+        typeof adapter.getToolDefinitions === "function"
+          ? adapter.getToolDefinitions()
+          : (adapter.constructor && adapter.constructor.tools) || {};
+
+      adapter = new NetworkBodyAdapter({
+        name: adapter.name,
+        host: adapter.host || "localhost",
+        port: adapter.port,
+        tools: declaredTools,
+      });
+    }
+
     if (this.bodies.has(adapter.name)) {
       throw new Error(`Space.addBody: body "${adapter.name}" already registered`);
     }
 
-    // Inspect transport: inprocess (default) or http (explicit network body).
     const transport = adapter.transport || "inprocess";
 
     adapter._attachSpace(this);
     this.bodies.set(adapter.name, adapter);
 
-    // Discover tools and build registry
-    const tools = typeof adapter.getToolDefinitions === "function"
-      ? adapter.getToolDefinitions()
-      : (adapter.constructor && adapter.constructor.tools) || {};
+    // Register tools now (from static or from discovery-so-far).
+    this._registerAdapterTools(adapter);
 
-    for (const [toolName, def] of Object.entries(tools)) {
-      this.toolRegistry.set(`${adapter.name}.${toolName}`, { body: adapter, tool: toolName, def });
+    // If this is a network body with no statically declared tools, run
+    // /discover in the background and republish tools when it returns.
+    if (adapter instanceof NetworkBodyAdapter && Object.keys(adapter.getToolDefinitions()).length === 0) {
+      this._pendingDiscovery = (this._pendingDiscovery || new Map());
+      const p = adapter.discoverTools()
+        .then(() => this.emit("body_discovered", { name: adapter.name, tools: Object.keys(adapter.getToolDefinitions()) }))
+        .catch((e) => this.emit("body_discovery_error", { name: adapter.name, error: e.message }));
+      this._pendingDiscovery.set(adapter.name, p);
     }
 
     this.emit("body_registered", {
       name: adapter.name,
       transport,
       port: adapter.port || null,
-      tools: Object.keys(tools),
+      tools: Object.keys(adapter.getToolDefinitions()),
     });
 
     return this;
+  }
+
+  /**
+   * Register (or re-register) the tool registry entries for an adapter.
+   * Called internally on addBody and after network discovery completes.
+   */
+  _registerAdapterTools(adapter) {
+    const tools =
+      typeof adapter.getToolDefinitions === "function"
+        ? adapter.getToolDefinitions()
+        : (adapter.constructor && adapter.constructor.tools) || {};
+
+    // Clear any existing registry entries for this body name
+    for (const fqn of [...this.toolRegistry.keys()]) {
+      if (fqn.startsWith(`${adapter.name}.`)) this.toolRegistry.delete(fqn);
+    }
+    for (const [toolName, def] of Object.entries(tools)) {
+      this.toolRegistry.set(`${adapter.name}.${toolName}`, { body: adapter, tool: toolName, def });
+    }
+  }
+
+  /**
+   * Resolve once every pending async operation (network discovery, auto-saves)
+   * has completed. Useful in tests and demos.
+   */
+  async ready() {
+    if (!this._pendingDiscovery) return;
+    await Promise.allSettled([...this._pendingDiscovery.values()]);
   }
 
   setBrain(brain) {
@@ -164,6 +246,81 @@ class Space extends EventEmitter {
     return this;
   }
 
+  /**
+   * Configure the confidence thresholds used when bodies report decisions
+   * via notifyDecision (from decideLocally). Decisions are classified:
+   *   >= autoApprove   -- executed silently (stat only)
+   *   >= monitor       -- executed, emits "confidence_warning"
+   *   <  escalate      -- emits "confidence_escalation" + increments
+   *                       escalatedByConfidence; caller may use this to
+   *                       force a brain re-evaluation.
+   *
+   * @param {{autoApprove?: number, monitor?: number, escalate?: number}} opts
+   */
+  setConfidenceThresholds(opts = {}) {
+    if (typeof opts.autoApprove === "number") this.confidenceThresholds.autoApprove = opts.autoApprove;
+    if (typeof opts.monitor === "number") this.confidenceThresholds.monitor = opts.monitor;
+    if (typeof opts.escalate === "number") this.confidenceThresholds.escalate = opts.escalate;
+    return this;
+  }
+
+  // -- Lateral events: direct body-to-body routing (no brain, no broadcast) --
+
+  /**
+   * Route `eventTypes` emitted by `fromBody` to `toBody.onPeerEvent(...)`.
+   * Repeat calls with the same triple are idempotent.
+   *
+   * @param {string} fromBody
+   * @param {string} toBody
+   * @param {string[]} eventTypes
+   */
+  link(fromBody, toBody, eventTypes) {
+    if (!this.bodies.has(fromBody)) throw new Error(`Space.link: unknown body "${fromBody}"`);
+    if (!this.bodies.has(toBody)) throw new Error(`Space.link: unknown body "${toBody}"`);
+    if (!Array.isArray(eventTypes) || eventTypes.length === 0) {
+      throw new Error("Space.link: eventTypes must be a non-empty array");
+    }
+    let byType = this._peerRoutes.get(fromBody);
+    if (!byType) { byType = new Map(); this._peerRoutes.set(fromBody, byType); }
+    for (const type of eventTypes) {
+      let targets = byType.get(type);
+      if (!targets) { targets = new Set(); byType.set(type, targets); }
+      targets.add(toBody);
+    }
+    return this;
+  }
+
+  unlink(fromBody, toBody, eventTypes) {
+    const byType = this._peerRoutes.get(fromBody);
+    if (!byType) return this;
+    const types = Array.isArray(eventTypes) ? eventTypes : [...byType.keys()];
+    for (const type of types) {
+      const targets = byType.get(type);
+      if (!targets) continue;
+      targets.delete(toBody);
+      if (targets.size === 0) byType.delete(type);
+    }
+    if (byType.size === 0) this._peerRoutes.delete(fromBody);
+    return this;
+  }
+
+  /**
+   * Called internally by BodyAdapter.sendToPeer and by onBodyEvent routing.
+   */
+  async _routePeerEvent(fromBody, toBody, eventType, payload, priority = "NORMAL") {
+    const target = this.bodies.get(toBody);
+    if (!target) return;
+    this.stats.peerEventsRouted++;
+    this.emit("peer_event", { from: fromBody, to: toBody, type: eventType, priority });
+    if (typeof target.onPeerEvent === "function") {
+      try {
+        await target.onPeerEvent(fromBody, eventType, payload, priority);
+      } catch (e) {
+        this.emit("peer_event_error", { from: fromBody, to: toBody, type: eventType, error: e.message });
+      }
+    }
+  }
+
   // -- Lifecycle --
 
   async run() {
@@ -184,13 +341,54 @@ class Space extends EventEmitter {
   }
 
   async stop() {
-    if (!this._running) return;
+    if (!this._running && !this._forceStop) return;
     this._running = false;
 
+    // Persist vertical memory before we exit.
+    if (this.verticalMemory && typeof this.verticalMemory.save === "function") {
+      try {
+        const n = await this.verticalMemory.save();
+        if (typeof n === "number") {
+          console.log(`[plexa] memory saved (${n} decisions)`);
+        }
+      } catch (e) {
+        this.emit("memory_error", { error: `save failed: ${e.message}` });
+      }
+    }
+
+    // Give every body a chance to persist its own pattern store.
     for (const body of this.bodies.values()) {
       try { await body.onEmergencyStop(); } catch {}
+      if (body.patternStore && typeof body.patternStore.save === "function") {
+        try {
+          body.patternStore.save();
+          console.log(`[scp] patterns saved for ${body.name} (${body.patternStore.patterns?.size ?? 0} entries)`);
+        } catch {}
+      }
+      if (body.adaptiveMemory && typeof body.adaptiveMemory.save === "function") {
+        try { await body.adaptiveMemory.save(); } catch {}
+      }
     }
     this.emit("stopped");
+  }
+
+  /**
+   * Install graceful shutdown handlers for SIGINT and SIGTERM. Calls
+   * stop() and exits after persistence completes. Idempotent.
+   */
+  installShutdownHandlers() {
+    if (this._autoSaveInstalled) return this;
+    this._autoSaveInstalled = true;
+    const handler = async (signal) => {
+      try {
+        this._forceStop = true;
+        await this.stop();
+      } catch {}
+      process.exit(signal === "SIGINT" ? 130 : 143);
+    };
+    process.once("SIGINT",  () => handler("SIGINT"));
+    process.once("SIGTERM", () => handler("SIGTERM"));
+    return this;
   }
 
   // -- Reactor: ticks every body, dispatches brain responses, calls brain at interval --
@@ -249,10 +447,55 @@ class Space extends EventEmitter {
       });
       this.stats.aggregations++;
 
+      // Vertical memory: if we have a confident match for this world state,
+      // skip the LLM and use the remembered decision.
+      if (this.verticalMemory && typeof this.verticalMemory.search === "function") {
+        let memoryHit = null;
+        try {
+          const matches = await this.verticalMemory.search(worldState, 3);
+          if (matches && matches.length > 0 && matches[0].confidence >= (this.verticalMemory.hitThreshold || 0.85)) {
+            memoryHit = matches[0];
+          }
+        } catch (e) {
+          this.emit("memory_error", { error: e.message });
+        }
+        if (memoryHit) {
+          this.stats.memoryHits++;
+          this.emit("memory_hit", { decision: memoryHit.decision, confidence: memoryHit.confidence });
+          if (memoryHit.decision && typeof memoryHit.decision === "object") {
+            this._brainResponseQueue.push(memoryHit.decision);
+          }
+          this._brainInFlight = false;
+          return;
+        }
+        this.stats.memoryMisses++;
+      }
+
+      // Inject memory hints into the world state so the brain sees them.
+      if (this.verticalMemory && typeof this.verticalMemory.search === "function") {
+        try {
+          const hints = await this.verticalMemory.search(worldState, 3);
+          if (Array.isArray(hints) && hints.length > 0) {
+            worldState.memory_hints = hints.map((h) => ({
+              body: h.body, tool: h.tool, confidence: h.confidence, age_ms: h.age_ms,
+            }));
+          }
+        } catch {}
+      }
+
       const intent = await this.brain.invoke(worldState);
       this.stats.brainCalls++;
 
-      if (intent) this._brainResponseQueue.push(intent);
+      if (intent) {
+        this._brainResponseQueue.push(intent);
+        // Write-through to vertical memory for future reuse.
+        if (this.verticalMemory && typeof this.verticalMemory.store === "function" && intent.target_body && intent.tool) {
+          Promise.resolve(this.verticalMemory.store(
+            intent.target_body, intent.tool, worldState, intent,
+            { confidence: 0.7, source: "brain", sessionId: this._sessionId }
+          )).catch((e) => this.emit("memory_error", { error: e.message }));
+        }
+      }
     } catch (e) {
       this.stats.brainErrors++;
       this.emit("brain_error", e);
@@ -373,12 +616,24 @@ class Space extends EventEmitter {
   onBodyEvent(bodyName, eventType, payload, priority = "NORMAL") {
     this.emit("body_event", { body: bodyName, type: eventType, payload, priority });
     this._addToHistory(`${bodyName}: ${eventType}`);
+
+    // Lateral routing: any peer links for this (fromBody, eventType) pair
+    // dispatch the event directly to the target body's onPeerEvent. Plexa
+    // never touches payload. No brain involvement. No broadcast.
+    const byType = this._peerRoutes.get(bodyName);
+    if (!byType) return;
+    const targets = byType.get(eventType);
+    if (!targets || targets.size === 0) return;
+    for (const toName of targets) {
+      if (toName === bodyName) continue; // prevent self-loops
+      this._routePeerEvent(bodyName, toName, eventType, payload, priority).catch(() => {});
+    }
   }
 
   /**
    * Called by a managed body when its local pattern store decides.
-   * Plexa records the decision so it can build vertical memory later
-   * and reason about what each body has been doing autonomously.
+   * Plexa applies confidence gating and, when a VerticalMemory is attached,
+   * records the decision for cross-session memory.
    *
    * @param {string} bodyName
    * @param {*} entity
@@ -388,7 +643,38 @@ class Space extends EventEmitter {
   onBodyDecision(bodyName, entity, decision, meta = {}) {
     this.stats.bodyDecisions = (this.stats.bodyDecisions || 0) + 1;
     this._addToHistory(`${bodyName} local -> ${decision}`);
+
+    // Confidence classification.
+    const confidence = typeof meta.confidence === "number" ? meta.confidence : null;
+    if (confidence !== null) {
+      const acc = this._confidenceSums.get(bodyName) || { sum: 0, count: 0 };
+      acc.sum += confidence; acc.count++;
+      this._confidenceSums.set(bodyName, acc);
+      this.stats.avgConfidenceByBody[bodyName] = Number((acc.sum / acc.count).toFixed(3));
+
+      const t = this.confidenceThresholds;
+      if (confidence < t.escalate) {
+        this.stats.escalatedByConfidence++;
+        this.emit("confidence_escalation", { body: bodyName, entity, decision, confidence, meta });
+      } else if (confidence < t.monitor) {
+        this.stats.lowConfidenceCount++;
+        this.emit("confidence_warning", { body: bodyName, entity, decision, confidence, meta });
+      } else if (confidence < t.autoApprove) {
+        this.stats.lowConfidenceCount++;
+        this.emit("confidence_warning", { body: bodyName, entity, decision, confidence, meta });
+      }
+    }
+
     this.emit("body_decision", { body: bodyName, entity, decision, meta, ts: Date.now() });
+
+    // Vertical memory write-through.
+    if (this.verticalMemory && typeof this.verticalMemory.store === "function") {
+      Promise.resolve(this.verticalMemory.store(bodyName, decision, entity, decision, {
+        confidence,
+        source: meta.source || "local",
+        sessionId: this._sessionId,
+      })).catch((e) => this.emit("memory_error", { error: e.message }));
+    }
   }
 
   _addToHistory(entry) {
@@ -409,6 +695,18 @@ class Space extends EventEmitter {
   }
 
   getStats() {
+    const brainStats = this.brain && typeof this.brain.stats === "function" ? this.brain.stats() : null;
+    const estimatedCostUSD = brainStats && typeof brainStats.totalCost === "number" ? brainStats.totalCost : 0;
+    // Savings estimate: average per-call cost times memory + cache hits.
+    const avgCostPerCall = brainStats && brainStats.calls > 0
+      ? brainStats.totalCost / brainStats.calls
+      : 0;
+    const cacheSavedCalls = (this.stats.memoryHits || 0);
+    const costSavedByCacheUSD = Number((cacheSavedCalls * avgCostPerCall).toFixed(6));
+    const memoryHitRate = (this.stats.memoryHits + this.stats.memoryMisses) > 0
+      ? Number((this.stats.memoryHits / (this.stats.memoryHits + this.stats.memoryMisses)).toFixed(3))
+      : 0;
+
     return {
       ...this.stats,
       running: this._running,
@@ -419,7 +717,13 @@ class Space extends EventEmitter {
       queuedResponses: this._brainResponseQueue.length,
       translator: this.translator.getStats(),
       aggregator: this.aggregator.getStats(),
-      brain: this.brain && typeof this.brain.stats === "function" ? this.brain.stats() : null,
+      brain: brainStats,
+      estimatedCostUSD: Number(estimatedCostUSD.toFixed(6)),
+      costSavedByCacheUSD,
+      memoryHitRate,
+      verticalMemory: this.verticalMemory && typeof this.verticalMemory.stats === "function"
+        ? this.verticalMemory.stats() : null,
+      confidenceThresholds: { ...this.confidenceThresholds },
     };
   }
 }

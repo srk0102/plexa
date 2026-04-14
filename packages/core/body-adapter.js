@@ -149,6 +149,32 @@ class BodyAdapter {
     this.space.onBodyDecision(this.name, entity, decision, meta);
   }
 
+  // -- Lateral (peer) events --
+
+  /**
+   * Send a direct event to another body in the same Space. Routed
+   * synchronously through Space._routePeerEvent. Does NOT go through the
+   * brain, the aggregator, or broadcast. Zero-latency in-process call.
+   *
+   * @param {string} targetBodyName
+   * @param {string} eventType
+   * @param {object} [payload]
+   * @param {string} [priority] CRITICAL | HIGH | NORMAL | LOW
+   */
+  async sendToPeer(targetBodyName, eventType, payload = {}, priority = "NORMAL") {
+    if (!this.space || typeof this.space._routePeerEvent !== "function") return;
+    await this.space._routePeerEvent(this.name, targetBodyName, eventType, payload, priority);
+  }
+
+  /**
+   * Override in a subclass to receive peer events. Default is a no-op.
+   * @param {string} fromBody
+   * @param {string} eventType
+   * @param {object} payload
+   * @param {string} priority
+   */
+  async onPeerEvent(/* fromBody, eventType, payload, priority */) { /* no-op */ }
+
   // -- Space attachment --
 
   _attachSpace(space) {
