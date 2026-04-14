@@ -9,6 +9,8 @@ const {
   Aggregator,
 } = require("./packages/core");
 const { OllamaBrain } = require("./packages/bridges/ollama");
+const { BedrockBrain } = require("./packages/bridges/bedrock");
+const { AnthropicBrain } = require("./packages/bridges/anthropic");
 const { attachIntrospection } = require("./packages/core/introspection");
 
 module.exports = {
@@ -21,5 +23,7 @@ module.exports = {
   Translator,
   Aggregator,
   OllamaBrain,
+  BedrockBrain,
+  AnthropicBrain,
   attachIntrospection,
 };

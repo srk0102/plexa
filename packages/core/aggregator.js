@@ -8,6 +8,68 @@ const PRIORITY_RANK = { CRITICAL: 0, HIGH: 1, NORMAL: 2, LOW: 3 };
 
 function priorityRank(p) { return PRIORITY_RANK[p] ?? PRIORITY_RANK.NORMAL; }
 
+// Prompt-injection sanitizer.
+//
+// Bodies read sensor data from the world. If any of that data ends up
+// in a body event payload or state field, an attacker can use it to
+// try to hijack the brain prompt. The aggregator is the choke point
+// between body-produced data and the LLM, so it is where we scrub.
+//
+// Patterns stripped (case-insensitive):
+//   - role prefixes: "system:", "assistant:", "user:", "human:"
+//   - chat template tokens: <|im_start|>, <|im_end|>, <|system|>, <|user|>,
+//     <|assistant|>, <|endoftext|>, <|...|> in general
+//   - Anthropic-style: "\n\nHuman:", "\n\nAssistant:"
+//   - directive phrases: "ignore previous instructions",
+//     "disregard previous", "you are now", "new instructions:"
+//
+// Each hit is replaced with "[redacted]" and counted on Aggregator.stats.
+const INJECTION_PATTERNS = [
+  // Chat template special tokens: <|anything|>
+  /<\|[^|]{0,40}\|>/gi,
+  // Role prefixes at line start or after whitespace
+  /(^|\s)(system|assistant|user|human)\s*:\s*/gi,
+  // Anthropic-style prompt markers
+  /\n\n(Human|Assistant)\s*:/gi,
+  // Common jailbreak directive phrases
+  /ignore (?:all |the )?previous (?:instructions|prompts|messages)/gi,
+  /disregard (?:all |the )?previous (?:instructions|prompts|messages)/gi,
+  /you are (?:now )?(?:a |an )?(?:different |new )?(?:ai|assistant|system|[a-z]+ ai|[a-z]+ assistant)\b/gi,
+  /new instructions\s*:/gi,
+  /forget (?:all |the |everything )?(?:above|previous)/gi,
+];
+
+function sanitizeString(s, report) {
+  if (typeof s !== "string") return s;
+  if (s.length === 0) return s;
+  let out = s;
+  let hits = 0;
+  for (const rx of INJECTION_PATTERNS) {
+    out = out.replace(rx, (m) => {
+      hits++;
+      return "[redacted]";
+    });
+  }
+  if (hits > 0 && report) report.hits += hits;
+  return out;
+}
+
+function sanitizeDeep(value, report) {
+  if (value == null) return value;
+  if (typeof value === "string") return sanitizeString(value, report);
+  if (Array.isArray(value)) return value.map((v) => sanitizeDeep(v, report));
+  if (typeof value === "object") {
+    const out = {};
+    for (const [k, v] of Object.entries(value)) {
+      // Keys themselves can be attacker-controlled if bodies ever use
+      // sensor strings as object keys. Sanitize both sides.
+      out[sanitizeString(k, report)] = sanitizeDeep(v, report);
+    }
+    return out;
+  }
+  return value;
+}
+
 class Aggregator {
   constructor(opts = {}) {
     this.tokenBudget = opts.tokenBudget || DEFAULT_TOKEN_BUDGET;
@@ -15,13 +77,30 @@ class Aggregator {
     this.staleMs = opts.staleMs || 1000;
     this.maxPendingEventsPerBody = opts.maxPendingEventsPerBody || 5;
 
+    this.sanitizeInjection = opts.sanitizeInjection !== false;
+
     this.stats = {
       aggregations: 0,
       trimmed: 0,
       droppedEvents: 0,
       droppedByPriority: { CRITICAL: 0, HIGH: 0, NORMAL: 0, LOW: 0 },
       maxTokens: 0,
+      injectionHits: 0,
+      injectionAggregations: 0, // how many aggregations had at least one hit
     };
+
+    // Observer may attach a listener via setSecurityListener so the Space
+    // can emit a high-priority security event when injection is detected.
+    this._securityListener = null;
+  }
+
+  /**
+   * Attach a listener that will be called with { hits, spaceName } whenever
+   * an aggregation contains at least one injection hit. The Space wires this
+   * to its own event emitter.
+   */
+  setSecurityListener(fn) {
+    this._securityListener = typeof fn === "function" ? fn : null;
   }
 
   aggregate(bodies, opts = {}) {
@@ -56,9 +135,57 @@ class Aggregator {
     }
 
     const budgeted = this._enforceBudget(out);
-    const size = this._tokenEstimate(budgeted);
+
+    // Prompt-injection sanitize at the very end: scrub every body-supplied
+    // string in the world state before it is handed to the brain. Tool
+    // definitions (authored by the developer, not the body runtime) are
+    // preserved unchanged so tool descriptions can legitimately contain
+    // words like "system" or "user".
+    let sanitized = budgeted;
+    if (this.sanitizeInjection) {
+      sanitized = this._sanitizeWorldState(budgeted, opts.spaceName || null);
+    }
+
+    const size = this._tokenEstimate(sanitized);
     if (size > this.stats.maxTokens) this.stats.maxTokens = size;
-    return budgeted;
+    return sanitized;
+  }
+
+  _sanitizeWorldState(worldState, spaceName) {
+    const report = { hits: 0 };
+    const out = {
+      timestamp: worldState.timestamp,
+      space: worldState.space,
+      active_goal: sanitizeString(worldState.active_goal, report),
+      recent_history: (worldState.recent_history || []).map((h) =>
+        typeof h === "string" ? sanitizeString(h, report) : sanitizeDeep(h, report)
+      ),
+      bodies: {},
+    };
+
+    for (const [name, body] of Object.entries(worldState.bodies || {})) {
+      const cleanBody = {};
+      for (const [k, v] of Object.entries(body)) {
+        if (k === "tools") {
+          // Tool schema is developer-authored, leave it intact.
+          cleanBody[k] = v;
+        } else {
+          cleanBody[k] = sanitizeDeep(v, report);
+        }
+      }
+      out.bodies[name] = cleanBody;
+    }
+
+    if (report.hits > 0) {
+      this.stats.injectionHits += report.hits;
+      this.stats.injectionAggregations++;
+      if (this._securityListener) {
+        try {
+          this._securityListener({ hits: report.hits, spaceName });
+        } catch { /* never let a listener break aggregation */ }
+      }
+    }
+    return out;
   }
 
   _compactTools(tools) {

@@ -34,7 +34,27 @@ class Space extends EventEmitter {
     this.historyCap = 10;
 
     this.translator = new Translator({ allowedTools: opts.allowedTools });
-    this.aggregator = new Aggregator({ tokenBudget: opts.tokenBudget });
+    this.aggregator = new Aggregator({
+      tokenBudget: opts.tokenBudget,
+      sanitizeInjection: opts.sanitizeInjection !== false,
+    });
+    // Surface sanitizer hits as a high-visibility security event.
+    this.aggregator.setSecurityListener((info) => {
+      this.stats.injectionHits = (this.stats.injectionHits || 0) + info.hits;
+      this.emit("security_event", {
+        type: "prompt_injection_detected",
+        hits: info.hits,
+        space: this.name,
+      });
+    });
+
+    // Pluggable gates. Order at dispatch time:
+    //   1. translator validates schema
+    //   2. safety rules (sync, cannot be bypassed)
+    //   3. approval hook (async, optional; can approve/reject/modify)
+    //   4. body.invokeTool
+    this._safetyRules = [];
+    this._approvalHook = null;
 
     this._running = false;
     this._tick = 0;
@@ -51,6 +71,9 @@ class Space extends EventEmitter {
       toolsDispatched: 0,
       toolsRejected: 0,
       toolErrors: 0,
+      safetyBlocked: 0,
+      approvalRejected: 0,
+      approvalModified: 0,
     };
   }
 
@@ -99,6 +122,45 @@ class Space extends EventEmitter {
 
   setGoal(goal) {
     this.activeGoal = goal;
+    return this;
+  }
+
+  // -- Safety + approval gates --
+
+  /**
+   * Register a safety rule. Rules run BEFORE the approval hook and cannot
+   * be bypassed. A rule must be a synchronous function that receives the
+   * validated command ({ body, tool, parameters }) and returns:
+   *   { allowed: true }                     -- pass
+   *   { allowed: false, reason: "..." }     -- block
+   *
+   * @param {(command: {body: string, tool: string, parameters: object}) => {allowed: boolean, reason?: string}} rule
+   */
+  addSafetyRule(rule) {
+    if (typeof rule !== "function") {
+      throw new Error("Space.addSafetyRule: rule must be a function");
+    }
+    this._safetyRules.push(rule);
+    return this;
+  }
+
+  /**
+   * Register a human-in-the-loop approval hook. Runs AFTER safety rules and
+   * AFTER translator validation, BEFORE body.invokeTool. A hook may be
+   * async and receives the validated command. It must return:
+   *   true                                           -- approve as-is
+   *   false                                          -- reject
+   *   { body, tool, parameters }                     -- modified command
+   *
+   * Only one hook may be registered; a second call replaces the first.
+   *
+   * @param {(command: {body: string, tool: string, parameters: object}) => (boolean|object|Promise<boolean|object>)} hook
+   */
+  addApprovalHook(hook) {
+    if (typeof hook !== "function") {
+      throw new Error("Space.addApprovalHook: hook must be a function");
+    }
+    this._approvalHook = hook;
     return this;
   }
 
@@ -151,10 +213,14 @@ class Space extends EventEmitter {
         }
       }
 
-      // 2. Drain queued brain tool calls
+      // 2. Drain queued brain tool calls. _dispatchIntent is async (safety
+      //    and approval gates may await) so we fire-and-forget; internal
+      //    errors are already emitted.
       while (this._brainResponseQueue.length > 0) {
         const intent = this._brainResponseQueue.shift();
-        this._dispatchIntent(intent);
+        this._dispatchIntent(intent).catch((e) => {
+          this.emit("dispatch_error", { intent, error: e.message });
+        });
       }
 
       // 3. Maybe call brain
@@ -197,7 +263,7 @@ class Space extends EventEmitter {
 
   // -- Tool dispatch: structured intent -> direct method call --
 
-  _dispatchIntent(intent) {
+  async _dispatchIntent(intent) {
     const result = this.translator.translate(intent, this.bodies);
 
     if (!result.ok) {
@@ -206,8 +272,85 @@ class Space extends EventEmitter {
       return;
     }
 
-    const { body: bodyName, tool, parameters } = result.command;
+    let command = result.command;
+
+    // Gate 1: safety rules (sync, cannot be bypassed). First blocker wins.
+    for (const rule of this._safetyRules) {
+      let verdict;
+      try {
+        verdict = rule(command);
+      } catch (e) {
+        verdict = { allowed: false, reason: `safety rule threw: ${e.message}` };
+      }
+      if (!verdict || verdict.allowed !== true) {
+        this.stats.safetyBlocked++;
+        this.stats.toolsRejected++;
+        const reason = (verdict && verdict.reason) || "safety rule denied";
+        this.emit("safety_blocked", { command, reason });
+        this.emit("intent_error", { intent, reason: "safety_blocked", error: reason });
+        return;
+      }
+    }
+
+    // Gate 2: approval hook (async, optional). Can modify the command.
+    if (typeof this._approvalHook === "function") {
+      let decision;
+      try {
+        decision = await this._approvalHook(command);
+      } catch (e) {
+        decision = false;
+        this.emit("approval_error", { command, error: e.message });
+      }
+
+      if (decision === false) {
+        this.stats.approvalRejected++;
+        this.stats.toolsRejected++;
+        this.emit("approval_rejected", { command });
+        this.emit("intent_error", { intent, reason: "approval_rejected", error: "hook returned false" });
+        return;
+      }
+
+      if (decision && typeof decision === "object") {
+        // Allow hook to modify the command. Re-validate shape.
+        const modified = {
+          body: typeof decision.body === "string" ? decision.body : command.body,
+          tool: typeof decision.tool === "string" ? decision.tool : command.tool,
+          parameters: (decision.parameters && typeof decision.parameters === "object" && !Array.isArray(decision.parameters))
+            ? decision.parameters : command.parameters,
+        };
+
+        // If the hook retargeted the body/tool, re-run the translator so
+        // we never dispatch a modified command with invalid params.
+        if (modified.body !== command.body || modified.tool !== command.tool) {
+          const revalidate = this.translator.translate(
+            { target_body: modified.body, tool: modified.tool, parameters: modified.parameters },
+            this.bodies
+          );
+          if (!revalidate.ok) {
+            this.stats.approvalRejected++;
+            this.stats.toolsRejected++;
+            this.emit("intent_error", { intent, reason: "approval_modified_invalid", error: revalidate.error });
+            return;
+          }
+          command = revalidate.command;
+        } else {
+          command = modified;
+        }
+        this.stats.approvalModified++;
+        this.emit("approval_modified", { command });
+      }
+    }
+
+    const { body: bodyName, tool, parameters } = command;
     const body = this.bodies.get(bodyName);
+
+    if (!body) {
+      // Only reachable if the hook retargeted to a body that got removed;
+      // translator would have caught a simply-wrong name.
+      this.stats.toolsRejected++;
+      this.emit("intent_error", { intent, reason: "unknown_body", error: bodyName });
+      return;
+    }
 
     this.stats.toolsDispatched++;
     this._addToHistory(`${bodyName}.${tool}`);

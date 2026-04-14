@@ -15,10 +15,12 @@
     "./core/translator": "./packages/core/translator.js",
     "./core/aggregator": "./packages/core/aggregator.js",
     "./bridges/ollama": "./packages/bridges/ollama.js",
+    "./bridges/bedrock": "./packages/bridges/bedrock.js",
+    "./bridges/anthropic": "./packages/bridges/anthropic.js",
     "./introspection": "./packages/core/introspection.js"
   },
   "scripts": {
-    "test": "node --test tests/plexa.test.js tests/managed-mode.test.js",
+    "test": "node --test tests/plexa.test.js tests/managed-mode.test.js tests/bridges.test.js tests/safety-approval.test.js tests/injection.test.js",
     "hello": "node examples/hello-world/index.js",
     "cli": "node bin/plexa"
   },
