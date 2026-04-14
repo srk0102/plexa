@@ -376,8 +376,11 @@ def main():
                 emit(rt, "state_update", {}, "NORMAL", state)
                 rt.last_state_update_emit = now
 
-        # 3. Command handling (managed mode only)
+        # 3. In managed mode: still use the local pattern store. Only the
+        #    LLM bridge is Plexa-owned. Any cached decision is acted on
+        #    immediately AND reported up so Plexa knows what the body did.
         if rt.mode == "managed":
+            # Plexa commands take precedence if one is pending
             with rt.lock:
                 cmd = rt.pending_command
                 rt.pending_command = None
@@ -388,10 +391,22 @@ def main():
                     reset_pole()
                 elif force is not None:
                     data.ctrl[0] = force
-                    # still log the decision for future learning
                     store.learn(state, discretize_force(force))
                 return
-            # No command pending -- hold steady
+
+            # Otherwise consult the local pattern store first (body stays intelligent)
+            cached = store.lookup(state)
+            if cached is not None:
+                force = force_from_decision(cached)
+                data.ctrl[0] = force
+                loop_cache += 1
+                # Tell Plexa what we decided locally
+                emit(rt, "body_decision",
+                     {"decision": cached, "source": "cache", "force": force},
+                     "NORMAL", state)
+                return
+
+            # No cache, no command: gentle hold and ping Plexa for guidance
             data.ctrl[0] = 0.0
             return
 

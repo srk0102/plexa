@@ -43,6 +43,11 @@ class BodyAdapter {
       throw new Error(`${this.name}: transport=http requires a port`);
     }
 
+    // Optional local pattern store. In managed mode the body still uses it;
+    // decisions are reported up to the Space for vertical memory.
+    this.patternStore = opts.patternStore || null;
+    this._lastCachedEntity = null;
+
     this.space = null;
     this.mode = "standalone";
 
@@ -59,6 +64,8 @@ class BodyAdapter {
       toolCalls: 0,
       toolErrors: 0,
       events: 0,
+      reports: 0,
+      decisions: 0,
     };
   }
 
@@ -71,6 +78,9 @@ class BodyAdapter {
   /**
    * Direct tool invocation. Used by Plexa for inprocess bodies.
    * Plexa wraps this in NetworkBodyAdapter when transport="http".
+   *
+   * If a pattern store is attached, the outcome is reported back to
+   * the cache after the tool runs (when evaluateOutcome is overridden).
    */
   async invokeTool(toolName, parameters = {}) {
     const tools = this.getToolDefinitions();
@@ -78,8 +88,65 @@ class BodyAdapter {
     const fn = this[toolName];
     if (typeof fn !== "function") throw new Error(`${this.name}: tool "${toolName}" declared but no method`);
     this.stats.toolCalls++;
-    try { return await fn.call(this, parameters || {}); }
-    catch (e) { this.stats.toolErrors++; throw e; }
+    try {
+      const result = await fn.call(this, parameters || {});
+      this._maybeReportOutcome();
+      return result;
+    } catch (e) {
+      this.stats.toolErrors++;
+      throw e;
+    }
+  }
+
+  /**
+   * Decide locally using the pattern store.
+   * In BOTH standalone and managed modes the body is intelligent.
+   * In managed mode the body additionally notifies Space of what it
+   * decided, so Plexa can build vertical memory / analytics.
+   */
+  decideLocally(entity) {
+    if (!this.patternStore) return null;
+    const result = this.patternStore.lookup(entity);
+    if (result) {
+      this._lastCachedEntity = entity;
+      this.notifyDecision(entity, result.decision, {
+        source: result.source || "cache",
+        confidence: result.confidence,
+      });
+    }
+    return result;
+  }
+
+  /**
+   * Remember which entity the last cached decision came from so a later
+   * outcome report can find it.
+   */
+  rememberCachedEntity(entity) { this._lastCachedEntity = entity; }
+
+  /**
+   * Override to return true (success) / false (failure) / null (skip).
+   */
+  evaluateOutcome(/* state */) { return null; }
+
+  _maybeReportOutcome() {
+    if (!this.patternStore || !this._lastCachedEntity) return;
+    let outcome;
+    try { outcome = this.evaluateOutcome(this._state.data); }
+    catch { return; }
+    if (outcome !== true && outcome !== false) return;
+    this.patternStore.report(this._lastCachedEntity, outcome);
+    this.stats.reports++;
+    if (outcome) this._lastCachedEntity = null;
+  }
+
+  /**
+   * Tell the orchestrator the body made a local decision.
+   * Direct function call (zero HTTP in-process). Safe without a Space.
+   */
+  notifyDecision(entity, decision, meta = {}) {
+    this.stats.decisions++;
+    if (!this.space || typeof this.space.onBodyDecision !== "function") return;
+    this.space.onBodyDecision(this.name, entity, decision, meta);
   }
 
   // -- Space attachment --

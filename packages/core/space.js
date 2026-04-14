@@ -232,6 +232,22 @@ class Space extends EventEmitter {
     this._addToHistory(`${bodyName}: ${eventType}`);
   }
 
+  /**
+   * Called by a managed body when its local pattern store decides.
+   * Plexa records the decision so it can build vertical memory later
+   * and reason about what each body has been doing autonomously.
+   *
+   * @param {string} bodyName
+   * @param {*} entity
+   * @param {string} decision
+   * @param {object} [meta]   { source: "exact"|"similar"|"reflex", confidence }
+   */
+  onBodyDecision(bodyName, entity, decision, meta = {}) {
+    this.stats.bodyDecisions = (this.stats.bodyDecisions || 0) + 1;
+    this._addToHistory(`${bodyName} local -> ${decision}`);
+    this.emit("body_decision", { body: bodyName, entity, decision, meta, ts: Date.now() });
+  }
+
   _addToHistory(entry) {
     this.history.push(entry);
     if (this.history.length > this.historyCap * 2) {
