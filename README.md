@@ -97,38 +97,51 @@ Ollama optional: install from [ollama.ai](https://ollama.ai) and run `ollama pul
 
 ```javascript
 const { Space, BodyAdapter, OllamaBrain } = require("@srk0102/plexa")
-const { HTTPTransport } = require("scp-protocol")
 
-class MyBody extends BodyAdapter {
-  constructor(transport) {
-    super({ name: "arm", capabilities: ["move_to", "halt"], transport })
+class CartpoleBody extends BodyAdapter {
+  static bodyName = "cartpole"
+  static tools = {
+    apply_force: {
+      description: "push the cart",
+      parameters: {
+        direction: { type: "string", enum: ["left","right"], required: true },
+        magnitude: { type: "number", min: 0, max: 1, required: true },
+      },
+    },
+  }
+  async apply_force({ direction, magnitude }) {
+    // physics here
+  }
+  async tick() {
+    // sensor loop called by Plexa at tickHz
   }
 }
 
-const transport = new HTTPTransport({ port: 3000 })
-await transport.start()
-
 const space = new Space("my_robot")
-space.addBody(new MyBody(transport))
+space.addBody(new CartpoleBody())
 space.setBrain(new OllamaBrain({ model: "llama3.2" }))
-space.setGoal("pick up the red box")
 space.run()
 ```
 
-Three imports. One class. Done.
+Tools are methods. No ports. No transport configuration. Plexa calls `body.invokeTool(...)` as a direct async call.
 
 ---
 
 ## Managed mode
 
-SCP adapters run in two modes:
+Connected bodies flip to `managed` mode automatically. Managed does NOT mean dumb.
 
-| Mode | Brain | Pattern store | Reflexes |
-|------|-------|--------------|----------|
-| **standalone** | Local LLM bridge | Local decisions | Local |
-| **managed** | Plexa | Logs only, no decisions | Local |
+| Mode | LLM layer | Pattern store | Reflexes | Reports |
+|------|-----------|--------------|----------|---------|
+| **standalone** | Body calls its own LLM | Local decisions | Local | — |
+| **managed** | Plexa owns the LLM | **Local decisions (still intelligent)** | Local | Body pings Space on every decision |
 
-Plexa automatically flips connected adapters to managed mode. The adapter keeps reflexes and physics local. The brain lives in Plexa.
+In managed mode:
+- The body keeps using its local pattern store to decide at muscle speed.
+- Every local decision fires `space.onBodyDecision(name, entity, decision, meta)` so Plexa can build vertical memory and stay aware.
+- Only the LLM path is routed through Plexa.
+
+Managed = coordinated, not lobotomized.
 
 ---
 
