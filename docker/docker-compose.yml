@@ -1,0 +1,42 @@
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: plexa_db
+    restart: unless-stopped
+    environment:
+      POSTGRES_PASSWORD: plexa
+      POSTGRES_DB: plexa
+    ports:
+      - "54320:5432"
+    volumes:
+      - plexa_db_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d plexa"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  ollama:
+    image: ollama/ollama:latest
+    container_name: plexa_brain
+    restart: unless-stopped
+    ports:
+      - "11434:11434"
+    volumes:
+      - plexa_ollama_data:/root/.ollama
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:11434/api/tags"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+
+volumes:
+  plexa_db_data:
+  plexa_ollama_data:

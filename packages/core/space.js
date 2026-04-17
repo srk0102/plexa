@@ -73,6 +73,15 @@ class Space extends EventEmitter {
     // Optional vertical memory (SQLite persistence across sessions).
     this.verticalMemory = opts.verticalMemory || null;
 
+    // Input extractor: converts world state into flat key-value features
+    // for vertical memory's evaluate(). Developer provides this so Plexa
+    // knows which signals to check against learned reasoning.
+    // Default: flatten body snapshot data into a single object.
+    this._inputExtractor = opts.inputExtractor || null;
+
+    // Schema retry: max attempts when LLM hallucinates a variable.
+    this._schemaRetryMax = opts.schemaRetryMax ?? 2;
+
     // Auto-save guards
     this._autoSaveInstalled = false;
 
@@ -447,23 +456,42 @@ class Space extends EventEmitter {
       });
       this.stats.aggregations++;
 
-      // Vertical memory: if we have a confident match for this world state,
-      // skip the LLM and use the remembered decision.
-      if (this.verticalMemory && typeof this.verticalMemory.search === "function") {
-        let memoryHit = null;
+      // -- Layer 1: Vertical memory reasoning evaluation --
+      // If vertical memory has reasoning patterns, EVALUATE them against
+      // current input. Each case gets a fresh decision. Not a cached answer.
+      if (this.verticalMemory) {
+        let memoryResult = null;
         try {
-          const matches = await this.verticalMemory.search(worldState, 3);
-          if (matches && matches.length > 0 && matches[0].confidence >= (this.verticalMemory.hitThreshold || 0.85)) {
-            memoryHit = matches[0];
+          // Extract flat features from world state for reasoning evaluation.
+          const currentInput = this._extractInput(worldState);
+
+          if (typeof this.verticalMemory.searchAndEvaluate === "function") {
+            // V2: reasoning-based evaluation (per-case, with guardrails + conflict resolution)
+            memoryResult = await this.verticalMemory.searchAndEvaluate(worldState, currentInput);
+          } else if (typeof this.verticalMemory.search === "function") {
+            // V1 fallback: plain answer cache lookup
+            const matches = await this.verticalMemory.search(worldState, 3);
+            if (matches && matches.length > 0 && matches[0].confidence >= (this.verticalMemory.hitThreshold || 0.85)) {
+              memoryResult = matches[0];
+            }
           }
         } catch (e) {
+          // Fail open: memory error should never block the brain call.
           this.emit("memory_error", { error: e.message });
         }
-        if (memoryHit) {
+
+        if (memoryResult && (memoryResult.passes || memoryResult.decision)) {
           this.stats.memoryHits++;
-          this.emit("memory_hit", { decision: memoryHit.decision, confidence: memoryHit.confidence });
-          if (memoryHit.decision && typeof memoryHit.decision === "object") {
-            this._brainResponseQueue.push(memoryHit.decision);
+          this.emit("memory_hit", {
+            decision: memoryResult.decision,
+            confidence: memoryResult.confidence,
+            from_reasoning: memoryResult.from_reasoning || false,
+            conflict: memoryResult.conflict || null,
+            guardrail_override: memoryResult.guardrail_override || null,
+          });
+          // If the reasoning evaluation produced a dispatchable intent, use it.
+          if (memoryResult.decision && typeof memoryResult.decision === "object") {
+            this._brainResponseQueue.push(memoryResult.decision);
           }
           this._brainInFlight = false;
           return;
@@ -471,29 +499,19 @@ class Space extends EventEmitter {
         this.stats.memoryMisses++;
       }
 
-      // Inject memory hints into the world state so the brain sees them.
-      if (this.verticalMemory && typeof this.verticalMemory.search === "function") {
-        try {
-          const hints = await this.verticalMemory.search(worldState, 3);
-          if (Array.isArray(hints) && hints.length > 0) {
-            worldState.memory_hints = hints.map((h) => ({
-              body: h.body, tool: h.tool, confidence: h.confidence, age_ms: h.age_ms,
-            }));
-          }
-        } catch {}
-      }
-
+      // -- Layer 2: Call the brain (LLM) --
+      // Only reached when vertical memory has no relevant reasoning.
       const intent = await this.brain.invoke(worldState);
       this.stats.brainCalls++;
 
       if (intent) {
         this._brainResponseQueue.push(intent);
-        // Write-through to vertical memory for future reuse.
+
+        // -- Layer 3: Store brain output as reasoning for future reuse --
         if (this.verticalMemory && typeof this.verticalMemory.store === "function" && intent.target_body && intent.tool) {
-          Promise.resolve(this.verticalMemory.store(
-            intent.target_body, intent.tool, worldState, intent,
-            { confidence: 0.7, source: "brain", sessionId: this._sessionId }
-          )).catch((e) => this.emit("memory_error", { error: e.message }));
+          // Extract reasoning from intent if the brain provided it.
+          const reasoning = intent._reasoning || null;
+          await this._storeWithRetry(intent.target_body, intent.tool, worldState, intent, reasoning);
         }
       }
     } catch (e) {
@@ -501,6 +519,67 @@ class Space extends EventEmitter {
       this.emit("brain_error", e);
     } finally {
       this._brainInFlight = false;
+    }
+  }
+
+  // -- Input extraction: world state -> flat features for reasoning evaluation --
+
+  _extractInput(worldState) {
+    // Developer-provided extractor has highest priority.
+    if (typeof this._inputExtractor === "function") {
+      return this._inputExtractor(worldState);
+    }
+    // Default: flatten body snapshot data into a single object.
+    const flat = {};
+    if (worldState.bodies && typeof worldState.bodies === "object") {
+      for (const [bodyName, bodyData] of Object.entries(worldState.bodies)) {
+        if (bodyData && typeof bodyData === "object") {
+          for (const [key, val] of Object.entries(bodyData)) {
+            if (key === "tools" || key === "pending_events") continue;
+            if (typeof val === "number" || typeof val === "string" || typeof val === "boolean") {
+              flat[`${bodyName}.${key}`] = val;
+            }
+          }
+        }
+      }
+    }
+    return flat;
+  }
+
+  // -- Store with schema retry: catch hallucinated vars, retry once --
+
+  async _storeWithRetry(bodyName, toolName, worldState, decision, reasoning) {
+    for (let attempt = 0; attempt <= this._schemaRetryMax; attempt++) {
+      try {
+        await this.verticalMemory.store(
+          bodyName, toolName, worldState, decision, reasoning,
+          { confidence: 0.5, source: "brain", sessionId: this._sessionId }
+        );
+        return; // success
+      } catch (e) {
+        if (e.code === "SCHEMA_VALIDATION_ERROR" && attempt < this._schemaRetryMax) {
+          this.emit("schema_retry", { attempt: attempt + 1, error: e.message, details: e.details });
+          // Retry: ask brain again with a corrective prompt.
+          if (this.brain && typeof this.brain.invoke === "function") {
+            try {
+              const corrected = await this.brain.invoke({
+                ...worldState,
+                _correction: `Previous response had invalid variables: ${e.details.join(", ")}. Use ONLY: ${this.verticalMemory.allowedVariables ? this.verticalMemory.allowedVariables.join(", ") : "any"}`,
+              });
+              if (corrected && corrected._reasoning) {
+                reasoning = corrected._reasoning;
+                decision = corrected;
+                continue; // retry store with corrected reasoning
+              }
+            } catch {
+              // Retry failed. Fall through to final catch.
+            }
+          }
+        }
+        // Final failure: log but don't crash. Fail open.
+        this.emit("memory_error", { error: e.message, code: e.code || "UNKNOWN" });
+        return;
+      }
     }
   }
 

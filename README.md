@@ -31,6 +31,57 @@ Let the body run at 60Hz. Push events up only when it cannot answer locally. The
 
 Familiar situations are handled locally. Novel situations wake the brain. Cost is proportional to novelty.
 
+## What's new in v2: the brain teaches reasoning, not answers
+
+Old vertical memory cached answers: `input -> "block"`. Every similar-but-different input needed the brain again.
+
+New vertical memory caches **reasoning**: `input -> { indicators, weights, threshold }`. Each new input is **evaluated individually** using the learned reasoning. Different people get different decisions from the same pattern. The brain is called once.
+
+```javascript
+// Brain teaches: "fraud looks like this"
+await memory.store("guard", "check", worldState, "block", {
+  indicators: [
+    { variable: "account_age_hours", weight: 0.3, condition: "< 24" },
+    { variable: "requests_per_hour", weight: 0.3, condition: "> 10", fuzzy: true },
+    { variable: "is_vpn", weight: 0.2, condition: "true" },
+  ],
+  compounds: [
+    { variables: ["account_age_hours", "is_vpn"], conditions: ["< 24", "true"], weight: 0.4 },
+  ],
+  threshold: 0.6,
+});
+
+// Now evaluate 4 different people. Zero brain calls. CPU math only.
+memory.evaluate({ account_age_hours: 2, requests_per_hour: 50, is_vpn: true });   // score 1.4 -> BLOCK
+memory.evaluate({ account_age_hours: 4320, requests_per_hour: 3, is_vpn: false }); // score 0.0 -> ALLOW
+memory.evaluate({ account_age_hours: 12, requests_per_hour: 9, is_vpn: false });   // score 0.5 -> ALLOW
+memory.evaluate({ account_age_hours: 8760, requests_per_hour: 2, is_vpn: true });  // score 0.2 -> ALLOW
+```
+
+Three types of indicators:
+- **Simple**: variable meets condition = full weight
+- **Fuzzy**: close to meeting condition = partial weight (catches boundary gamers)
+- **Compound**: multiple variables must ALL match = bonus weight (catches synergistic risk)
+
+## Three-tier safety
+
+```javascript
+// Level 1: Immutable guardrails (code-level, cannot be overridden)
+memory.addGuardrail((input, proposedDecision) => {
+  if (input.account_age_hours > 8760 && proposedDecision === "block") return "allow";
+  return null;
+});
+
+// Level 2: Schema validation (rejects hallucinated variables from LLM)
+const memory = new VerticalMemory({
+  allowedVariables: ["account_age_hours", "requests_per_hour", "has_2fa", "is_vpn"],
+});
+// LLM invents "days_since_creation"? SchemaValidationError. Rejected. Auto-retry.
+
+// Level 3: Conflict resolution (when multiple heuristics fire)
+// Highest confidence wins. Same confidence = most recent wins. Tie = fail-open (allow).
+```
+
 ## Install
 
 ```bash
@@ -81,23 +132,47 @@ push left @0.3
 | One body | `npm install scp-protocol` |
 | Several bodies, one brain | `npm install @srk0102/plexa` |
 
+## Five brain bridges (vendor-agnostic)
+
+```javascript
+const { OllamaBrain }    = require("@srk0102/plexa/bridges/ollama")    // local, free
+const { OpenAIBrain }    = require("@srk0102/plexa/bridges/openai")    // GPT-4o
+const { AnthropicBrain } = require("@srk0102/plexa/bridges/anthropic") // Claude
+const { BedrockBrain }   = require("@srk0102/plexa/bridges/bedrock")   // AWS Nova
+const { TogetherBrain }  = require("@srk0102/plexa/bridges/together")  // Llama, Qwen
+```
+
+The brain writes the reasoning once. Vertical memory stores it. After that, the brain type doesn't matter - `evaluate()` runs on CPU math regardless of who taught it. Zero vendor lock-in.
+
+## Persistence
+
+```javascript
+// SQLite (default, zero config)
+const memory = new VerticalMemory({ dbPath: "./memory.db" });
+
+// Postgres (production)
+const { PostgresAdapter } = require("@srk0102/plexa/adapters/postgres");
+const memory = new VerticalMemory({
+  dbAdapter: new PostgresAdapter({ connectionString: "postgres://..." }),
+});
+```
+
 ## Not just robotics
 
 Plexa orchestrates any system that runs continuously and pushes events:
 
 ```
-Game NPCs   Robot arms   Web servers   Log monitors   API gateways   Any loop
+Robot vacuums   Game NPCs   Robot arms   Web servers   Fraud detectors   API gateways   Any loop
 ```
 
-Three ready-to-run software backend examples are in `examples/`:
+Ready-to-run examples in `examples/`:
 
 ```bash
+node examples/fraud-detector/index.js   # API security with reasoning + guardrails
 node examples/web-server/index.js
 node examples/log-monitor/index.js
 node examples/api-gateway/index.js
 ```
-
-See [`examples/web-backend`](https://srk-e37e8aa3.mintlify.app/examples/web-backend) in the docs.
 
 ## Adapters tested
 

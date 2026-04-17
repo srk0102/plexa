@@ -1,6 +1,6 @@
 {
   "name": "@srk0102/plexa",
-  "version": "0.5.2",
+  "version": "1.0.0",
   "description": "Orchestration framework above SCP. One brain, many bodies.",
   "main": "index.js",
   "bin": {
@@ -19,6 +19,9 @@
     "./bridges/ollama": "./packages/bridges/ollama.js",
     "./bridges/bedrock": "./packages/bridges/bedrock.js",
     "./bridges/anthropic": "./packages/bridges/anthropic.js",
+    "./bridges/openai": "./packages/bridges/openai.js",
+    "./bridges/together": "./packages/bridges/together.js",
+    "./adapters/postgres": "./packages/adapters/postgres.js",
     "./introspection": "./packages/core/introspection.js"
   },
   "scripts": {
@@ -43,6 +46,7 @@
     "node": ">=18.0.0"
   },
   "dependencies": {
+    "pg": "^8.20.0",
     "scp-protocol": "^0.5.0"
   },
   "files": [
