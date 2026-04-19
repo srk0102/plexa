@@ -31,6 +31,32 @@ Let the body run at 60Hz. Push events up only when it cannot answer locally. The
 
 Familiar situations are handled locally. Novel situations wake the brain. Cost is proportional to novelty.
 
+## Proof: NVIDIA Isaac Sim, Plexa vs no-memory baseline
+
+Two Nova Carter robots, same arena, same Claude Haiku 4.5 brain, same obstacle course. One uses Plexa (`VerticalMemory` + `recordOutcome`). The other has `bypass_cache: true` and asks the model on every encounter.
+
+<p align="center">
+  <a href="https://vimeo.com/1184631311">
+    <img src="https://vumbnail.com/1184631311_large.jpg" width="720" alt="Plexa vs no-memory baseline — 5:37 demo on Vimeo"/>
+  </a>
+  <br/>
+  <a href="https://vimeo.com/1184631311"><b>▶ Watch full demo on Vimeo</b></a>  ·  5:37  ·  NVIDIA Isaac Sim + Claude Haiku 4.5
+</p>
+
+| | PLEXA (`VerticalMemory`) | NAIVE (`bypass_cache=true`) |
+|---|---|---|
+| Finish time | **270.8 s** | 376.5 s |
+| Brain calls | 5 | 11 |
+| Memory hits | 4 | 0 |
+| Collisions | **0** | 2 |
+| Avg decision latency | **0.22 ms** | 1338 ms |
+
+**Plexa won by 105.7 seconds.** Decision-layer speedup: **6,111x**. Naive crashed twice on classes Plexa had already learned to handle, because Naive has no `recordOutcome` to remember the last failure.
+
+The dashboard in the recording shows every `VerticalMemory.searchAndEvaluate` hit, every `AnthropicBrain._rawCall`, the stored reasoning per class, confidence decay, and the `addGuardrail` safety layer wired in. White box throughout.
+
+Source for this demo: [`srk0102/SCP/tree/master/demo`](https://github.com/srk0102/SCP) (uses `@srk0102/plexa` as the orchestration package, `scp-protocol` as the body-side cache).
+
 ## What's new in v2: the brain teaches reasoning, not answers
 
 Old vertical memory cached answers: `input -> "block"`. Every similar-but-different input needed the brain again.
